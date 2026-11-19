@@ -28,6 +28,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -46,6 +47,7 @@ class DownloadWorker @AssistedInject constructor(
     private val downloadDao: DownloadDao,
     private val animepaheScraper: AnimepaheScraper,
     private val mangaKatanaScraper: MangaKatanaScraper,
+    private val cookieResolver: CloudflareCookieResolver,
     private val okHttpClient: OkHttpClient
 ) : CoroutineWorker(appContext, params) {
 
@@ -54,7 +56,9 @@ class DownloadWorker @AssistedInject constructor(
         if (taskId <= 0L) return Result.failure()
 
         val task = downloadDao.getById(taskId) ?: return Result.failure()
-        setForeground(createForegroundInfo(task, 0, task.totalSegments.coerceAtLeast(1)))
+        runCatching {
+            setForeground(createForegroundInfo(task, 0, task.totalSegments.coerceAtLeast(1)))
+        }
         downloadDao.updateStatus(taskId, DownloadStatus.STARTED)
 
         return try {
@@ -80,11 +84,24 @@ class DownloadWorker @AssistedInject constructor(
     }
 
     private suspend fun downloadAnimeEpisode(task: DownloadTaskEntity) = withContext(Dispatchers.IO) {
-        val manifestUrl = task.manifestUrl.ifBlank {
+        var manifestUrl = task.manifestUrl.ifBlank {
+            if (task.sourceUrl.isBlank()) throw IOException("Missing stream source URL")
             animepaheScraper.getHlsPlaylist(task.sourceUrl).manifestUrl
         }
 
-        val initialText = fetchText(manifestUrl, AnimepaheScraper.KWIK_HEADERS)
+        val initialText = try {
+            fetchText(manifestUrl, AnimepaheScraper.KWIK_HEADERS)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (t: Throwable) {
+            // Signed Kwik manifest URLs can expire between pause/resume; refresh from sourceUrl once.
+            if (task.sourceUrl.isNotBlank()) {
+                manifestUrl = animepaheScraper.getHlsPlaylist(task.sourceUrl).manifestUrl
+                fetchText(manifestUrl, AnimepaheScraper.KWIK_HEADERS)
+            } else {
+                throw t
+            }
+        }
         val mediaPlaylistUrl: String
         val mediaPlaylistText: String
         when (val parsed = HlsParser.parse(initialText, manifestUrl)) {
@@ -171,7 +188,9 @@ class DownloadWorker @AssistedInject constructor(
                                 speedBytesPerSec = speed,
                                 manifestUrl = manifestUrl
                             )
-                            setForegroundAsync(createForegroundInfo(task, doneNow, segments.size))
+                            runCatching {
+                                setForegroundAsync(createForegroundInfo(task, doneNow, segments.size))
+                            }
                         }
                     }
                 }
@@ -187,19 +206,29 @@ class DownloadWorker @AssistedInject constructor(
         val outputMp4 = File(outDir, "$safeFile.mp4")
         val combinedTemp = File(segDir, "combined.ts")
 
-        val finalSize = runCatching {
-            Mp4Remuxer.remuxSegmentsToMp4(orderedSegments, combinedTemp, outputMp4)
-        }.getOrElse {
-            // Fallback: copy combined TS if a rare device codec rejects MediaMuxer
+        var remuxSucceeded = false
+        val finalSize = try {
+            val size = Mp4Remuxer.remuxSegmentsToMp4(orderedSegments, combinedTemp, outputMp4)
+            remuxSucceeded = outputMp4.exists() && size > 0L
+            size
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            // Delete any corrupt/partial MP4 so fallback .ts is used cleanly.
+            runCatching { if (outputMp4.exists()) outputMp4.delete() }
             val fallbackTs = File(outDir, "$safeFile.ts")
             if (combinedTemp.exists()) combinedTemp.copyTo(fallbackTs, overwrite = true)
             fallbackTs.length()
         }
 
-        val finalLocation = if (outputMp4.exists() && outputMp4.length() > 0L) {
+        val finalLocation = if (remuxSucceeded) {
             outputMp4.absolutePath
         } else {
-            File(outDir, "$safeFile.ts").absolutePath
+            val fallbackTs = File(outDir, "$safeFile.ts")
+            if (!fallbackTs.exists() && combinedTemp.exists()) {
+                combinedTemp.copyTo(fallbackTs, overwrite = true)
+            }
+            fallbackTs.absolutePath
         }
 
         segDir.deleteRecursively()
@@ -226,6 +255,7 @@ class DownloadWorker @AssistedInject constructor(
         val doneCounter = AtomicInteger(completedIndices.size)
         val totalBytes = AtomicLong(0L)
         val lastUiUpdate = AtomicLong(0L)
+        val chapterReferer = task.sourceUrl.ifBlank { "${MangaKatanaScraper.SITE_URL}/" }
 
         downloadDao.updateProgress(
             taskId = task.id,
@@ -236,21 +266,34 @@ class DownloadWorker @AssistedInject constructor(
             manifestUrl = task.sourceUrl
         )
 
-        val semaphore = Semaphore(10)
+        val semaphore = Semaphore(6)
         coroutineScope {
             imageUrls.mapIndexedNotNull { idx, url ->
                 if (idx in completedIndices) null else idx to url
             }.map { (idx, url) ->
+                val candidates = (listOf(url) + chapterMedia.fallbackServers.mapNotNull { it.getOrNull(idx) }).distinct()
                 async {
                     semaphore.withPermit {
                         val imgFile = File(chapterDir, "img-${idx.toString().padStart(4, '0')}.jpg")
                         val startNs = System.nanoTime()
-                        val bytes = fetchBytesWithRetry(url, mapOf("Referer" to MangaKatanaScraper.SITE_URL))
-                        imgFile.writeBytes(bytes)
-                        totalBytes.addAndGet(bytes.size.toLong())
+                        var bytes: ByteArray? = null
+                        var lastErr: Throwable? = null
+                        for (candidate in candidates) {
+                            try {
+                                bytes = fetchBytesWithRetry(candidate, mapOf("Referer" to chapterReferer))
+                                break
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (t: Throwable) {
+                                lastErr = t
+                            }
+                        }
+                        val resolvedBytes = bytes ?: throw (lastErr ?: IOException("Failed downloading page ${idx + 1}"))
+                        imgFile.writeBytes(resolvedBytes)
+                        totalBytes.addAndGet(resolvedBytes.size.toLong())
 
                         val elapsedSec = ((System.nanoTime() - startNs) / 1_000_000_000.0).coerceAtLeast(0.05)
-                        val speed = (bytes.size / elapsedSec).toLong()
+                        val speed = (resolvedBytes.size / elapsedSec).toLong()
                         downloadDao.markSegmentDone(DownloadSegmentEntity(task.id, idx))
                         val doneNow = doneCounter.incrementAndGet()
                         val now = System.currentTimeMillis()
@@ -264,7 +307,9 @@ class DownloadWorker @AssistedInject constructor(
                                 speedBytesPerSec = speed,
                                 manifestUrl = task.sourceUrl
                             )
-                            setForegroundAsync(createForegroundInfo(task, doneNow, imageUrls.size))
+                            runCatching {
+                                setForegroundAsync(createForegroundInfo(task, doneNow, imageUrls.size))
+                            }
                         }
                     }
                 }
@@ -296,26 +341,28 @@ class DownloadWorker @AssistedInject constructor(
         )
     }
 
-    private fun fetchText(url: String, headers: Map<String, String>): String {
+    private suspend fun fetchText(url: String, headers: Map<String, String>): String {
         val bytes = fetchBytesWithRetry(url, headers)
         return bytes.toString(Charsets.UTF_8)
     }
 
-    private fun fetchBytesWithRetry(url: String, headers: Map<String, String>): ByteArray {
+    private suspend fun fetchBytesWithRetry(url: String, headers: Map<String, String>): ByteArray {
         var lastError: Throwable? = null
         repeat(4) { attempt ->
             try {
                 val builder = Request.Builder()
                     .url(url)
-                    .header("User-Agent", CloudflareCookieResolver.DEFAULT_USER_AGENT)
+                    .header("User-Agent", cookieResolver.cachedUserAgent)
                 headers.forEach { (k, v) -> builder.header(k, v) }
                 okHttpClient.newCall(builder.build()).execute().use { resp ->
                     if (!resp.isSuccessful) throw IOException("HTTP ${resp.code} for $url")
                     return resp.body?.bytes() ?: ByteArray(0)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (t: Throwable) {
                 lastError = t
-                if (attempt < 3) Thread.sleep(800L * (attempt + 1))
+                if (attempt < 3) delay(800L * (attempt + 1))
             }
         }
         throw lastError ?: IOException("Failed downloading $url")
@@ -344,10 +391,10 @@ class DownloadWorker @AssistedInject constructor(
         }
     }
 
-    private fun sanitizePath(raw: String): String =
-        raw.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { "item" }
-
     companion object {
         const val KEY_TASK_ID = "task_id"
+
+        fun sanitizePath(raw: String): String =
+            raw.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim().ifBlank { "item" }
     }
 }

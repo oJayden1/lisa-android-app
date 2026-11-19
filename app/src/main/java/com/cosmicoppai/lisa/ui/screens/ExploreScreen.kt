@@ -19,7 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -36,7 +36,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -50,6 +49,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
+import com.cosmicoppai.lisa.data.remote.InteractiveCaptchaException
 import com.cosmicoppai.lisa.data.repository.MediaRepository
 import com.cosmicoppai.lisa.model.AnimeExploreCategory
 import com.cosmicoppai.lisa.model.AnimeSearchItem
@@ -69,9 +69,12 @@ import com.cosmicoppai.lisa.ui.theme.LisaSurfaceVariant
 import com.cosmicoppai.lisa.ui.theme.LisaTextPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaTextSecondary
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -84,7 +87,9 @@ data class ExploreUiState(
     val hasPrev: Boolean = false,
     val isLoading: Boolean = false,
     val isResolvingItem: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    val requiresVerification: Boolean = false,
+    val verificationSiteUrl: String = ""
 )
 
 @HiltViewModel
@@ -98,27 +103,65 @@ class ExploreViewModel @Inject constructor(
     private val _appMode = MutableStateFlow(AppMode.ANIME)
     val appMode: StateFlow<AppMode> = _appMode.asStateFlow()
 
+    private var loadJob: kotlinx.coroutines.Job? = null
+    private var resolveJob: kotlinx.coroutines.Job? = null
+    private var lastPendingResolve: Triple<ExploreItem, (AnimeSearchItem) -> Unit, (MangaSearchItem) -> Unit>? = null
+
     init {
         viewModelScope.launch {
-            repository.settings.collect { s ->
-                val changed = _appMode.value != s.appMode || _uiState.value.items.isEmpty()
-                _appMode.value = s.appMode
-                if (changed) loadPage(0)
-            }
+            repository.settings
+                .map { it.appMode }
+                .distinctUntilChanged()
+                .collect { mode ->
+                    val changed = _appMode.value != mode || _uiState.value.items.isEmpty()
+                    if (_appMode.value != mode) {
+                        resolveJob?.cancel()
+                        _uiState.value = _uiState.value.copy(
+                            isResolvingItem = false,
+                            error = null,
+                            requiresVerification = false,
+                            verificationSiteUrl = ""
+                        )
+                    }
+                    _appMode.value = mode
+                    if (changed) loadPage(0)
+                }
         }
     }
 
     fun setMode(mode: AppMode) {
+        resolveJob?.cancel()
+        loadJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            isResolvingItem = false,
+            error = null,
+            requiresVerification = false,
+            verificationSiteUrl = ""
+        )
         viewModelScope.launch { repository.setAppMode(mode) }
     }
 
     fun selectAnimeCategory(cat: AnimeExploreCategory) {
-        _uiState.value = _uiState.value.copy(animeCategory = cat)
+        resolveJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            animeCategory = cat,
+            isResolvingItem = false,
+            error = null,
+            requiresVerification = false,
+            verificationSiteUrl = ""
+        )
         loadPage(0)
     }
 
     fun selectMangaCategory(cat: MangaExploreCategory) {
-        _uiState.value = _uiState.value.copy(mangaCategory = cat)
+        resolveJob?.cancel()
+        _uiState.value = _uiState.value.copy(
+            mangaCategory = cat,
+            isResolvingItem = false,
+            error = null,
+            requiresVerification = false,
+            verificationSiteUrl = ""
+        )
         loadPage(0)
     }
 
@@ -131,25 +174,38 @@ class ExploreViewModel @Inject constructor(
     }
 
     fun loadPage(offset: Int = _uiState.value.offset) {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isLoading = true, error = null, offset = offset)
-            runCatching {
-                when (_appMode.value) {
+        val requestedMode = _appMode.value
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isLoading = true,
+                error = null,
+                requiresVerification = false,
+                verificationSiteUrl = "",
+                offset = offset
+            )
+            try {
+                val page = when (requestedMode) {
                     AppMode.ANIME -> repository.getTopAnime(_uiState.value.animeCategory, offset)
                     AppMode.MANGA -> repository.getTopManga(_uiState.value.mangaCategory, offset)
                 }
-            }.onSuccess { page ->
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    items = page.items,
-                    hasNext = page.hasNext,
-                    hasPrev = page.hasPrev
-                )
-            }.onFailure { err ->
-                _uiState.value = _uiState.value.copy(
-                    isLoading = false,
-                    error = err.message ?: "Failed to load Explore"
-                )
+                if (_appMode.value == requestedMode) {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        items = page.items,
+                        hasNext = page.hasNext,
+                        hasPrev = page.hasPrev
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
+                if (_appMode.value == requestedMode) {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        error = err.message ?: "Failed to load Explore"
+                    )
+                }
             }
         }
     }
@@ -159,23 +215,60 @@ class ExploreViewModel @Inject constructor(
         onAnimeResolved: (AnimeSearchItem) -> Unit,
         onMangaResolved: (MangaSearchItem) -> Unit
     ) {
-        if (_uiState.value.isResolvingItem) return
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(isResolvingItem = true, error = null)
-            runCatching {
-                if (item.mediaType == MediaType.ANIME) {
+        val expectedMode = if (item.mediaType == MediaType.ANIME) AppMode.ANIME else AppMode.MANGA
+        lastPendingResolve = Triple(item, onAnimeResolved, onMangaResolved)
+        resolveJob?.cancel()
+        resolveJob = viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isResolvingItem = true,
+                error = null,
+                requiresVerification = false,
+                verificationSiteUrl = ""
+            )
+            try {
+                val (anime, manga) = if (item.mediaType == MediaType.ANIME) {
                     val found = repository.resolveExploreAnime(item.title)
                         ?: error("Could not find ${item.title} on AnimePahe")
-                    onAnimeResolved(found)
+                    found to null
                 } else {
                     val found = repository.resolveExploreManga(item.title)
                         ?: error("Could not find ${item.title} on MangaKatana")
-                    onMangaResolved(found)
+                    null to found
                 }
-            }.onFailure { err ->
-                _uiState.value = _uiState.value.copy(error = err.message)
+                if (_appMode.value == expectedMode) {
+                    _uiState.value = _uiState.value.copy(isResolvingItem = false)
+                    if (anime != null) onAnimeResolved(anime)
+                    if (manga != null) onMangaResolved(manga)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
+                if (_appMode.value == expectedMode) {
+                    val captcha = err as? InteractiveCaptchaException
+                    _uiState.value = _uiState.value.copy(
+                        isResolvingItem = false,
+                        error = err.message,
+                        requiresVerification = captcha != null,
+                        verificationSiteUrl = captcha?.siteUrl.orEmpty()
+                    )
+                }
             }
-            _uiState.value = _uiState.value.copy(isResolvingItem = false)
+        }
+    }
+
+    fun verifyAndRetry() {
+        val siteUrl = _uiState.value.verificationSiteUrl.takeIf { it.isNotBlank() }
+        repository.requestAnimepaheVerification(siteUrl) { passed ->
+            if (passed) {
+                _uiState.value = _uiState.value.copy(
+                    error = null,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
+                )
+                lastPendingResolve?.let { (item, onAnime, onManga) ->
+                    resolveItem(item, onAnime, onManga)
+                }
+            }
         }
     }
 }
@@ -250,17 +343,54 @@ fun ExploreScreen(
         when {
             state.isLoading -> LisaLoadingView("Loading Top ${mode.label}...")
             state.error != null && state.items.isEmpty() -> {
-                LisaErrorView(message = state.error!!, onRetry = { viewModel.loadPage() })
+                LisaErrorView(
+                    message = state.error!!,
+                    onRetry = { viewModel.loadPage() },
+                    secondaryActionLabel = if (state.requiresVerification) "Verify & Retry" else null,
+                    onSecondaryAction = if (state.requiresVerification) viewModel::verifyAndRetry else null
+                )
             }
             else -> {
                 Column(modifier = Modifier.fillMaxSize()) {
                     if (state.error != null) {
-                        Text(
-                            text = state.error!!,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.labelMedium,
-                            modifier = Modifier.padding(bottom = 6.dp)
-                        )
+                        if (state.requiresVerification) {
+                            Surface(
+                                color = LisaSurface,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, LisaPrimary.copy(alpha = 0.55f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = state.error!!,
+                                        color = LisaTextPrimary,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Button(
+                                        onClick = viewModel::verifyAndRetry,
+                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("Verify & Retry")
+                                    }
+                                }
+                            }
+                        } else {
+                            Text(
+                                text = state.error!!,
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelMedium,
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            )
+                        }
                     }
                     LazyVerticalGrid(
                         columns = GridCells.Adaptive(minSize = 152.dp),
@@ -269,7 +399,10 @@ fun ExploreScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier.weight(1f)
                     ) {
-                        items(state.items, key = { "${it.rank}_${it.title}" }) { item ->
+                        itemsIndexed(
+                            items = state.items,
+                            key = { idx, item -> "${mode.name}_${state.offset}_${item.rank}_${item.title}_$idx" }
+                        ) { _, item ->
                             ExploreCard(
                                 item = item,
                                 onClick = {

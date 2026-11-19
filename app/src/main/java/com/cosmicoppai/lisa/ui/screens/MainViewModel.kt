@@ -35,14 +35,22 @@ class MainViewModel @Inject constructor(
         viewModelScope.launch { repository.setAppMode(mode) }
     }
 
-    fun completeInteractiveChallenge(req: CookieChallengeRequest) {
+    fun completeInteractiveChallenge(
+        req: CookieChallengeRequest,
+        finalUrl: String,
+        userAgent: String
+    ) {
         viewModelScope.launch {
-            repository.persistInteractiveChallenge(req.siteName, req.siteUrl)
+            repository.persistInteractiveChallenge(
+                siteName = req.siteName,
+                siteUrl = finalUrl.ifBlank { req.siteUrl },
+                userAgentOverride = userAgent
+            )
             req.onCompleted(true)
         }
     }
 
-    fun dismissInteractiveChallenge(req: CookieChallengeRequest) {
-        req.onCompleted(false)
+    fun dismissInteractiveChallenge() {
+        repository.dismissInteractiveChallenge()
     }
 }

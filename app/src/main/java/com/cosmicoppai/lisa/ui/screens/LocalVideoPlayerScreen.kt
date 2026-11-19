@@ -39,6 +39,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.cosmicoppai.lisa.data.local.entity.DownloadTaskEntity
@@ -98,6 +100,10 @@ fun LocalVideoPlayerScreen(
         }
         onDispose {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            activity?.window?.let { win ->
+                WindowCompat.getInsetsController(win, win.decorView)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
         }
     }
 
@@ -115,6 +121,7 @@ fun LocalVideoPlayerScreen(
     }
 
     val file = remember(task.fileLocation) { File(task.fileLocation!!) }
+    var playbackError by remember(file) { mutableStateOf<String?>(null) }
     val exoPlayer = remember(context, file) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
@@ -124,7 +131,18 @@ fun LocalVideoPlayerScreen(
     }
 
     DisposableEffect(exoPlayer) {
-        onDispose { exoPlayer.release() }
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                playbackError = error.cause?.message?.takeIf { it.isNotBlank() }
+                    ?: error.message?.takeIf { it.isNotBlank() }
+                    ?: "Unable to play local video (${error.errorCodeName})"
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose {
+            exoPlayer.removeListener(listener)
+            exoPlayer.release()
+        }
     }
 
     Column(
@@ -139,16 +157,16 @@ fun LocalVideoPlayerScreen(
                 onBack = onBack,
                 actions = {
                     IconButton(onClick = {
-                        val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            file
-                        )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, "video/*")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
                         runCatching {
+                            val uri = FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.fileprovider",
+                                file
+                            )
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, "video/*")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
                             context.startActivity(Intent.createChooser(intent, "Open in External Player"))
                         }
                     }) {
@@ -158,32 +176,45 @@ fun LocalVideoPlayerScreen(
             )
         }
 
-        Box(modifier = Modifier.fillMaxSize()) {
-            AndroidView(
-                modifier = Modifier.fillMaxSize(),
-                factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        layoutParams = FrameLayout.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        player = exoPlayer
-                        useController = true
-                    }
+        if (playbackError != null) {
+            LisaErrorView(
+                message = playbackError!!,
+                onRetry = {
+                    playbackError = null
+                    exoPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
+                    exoPlayer.prepare()
+                    exoPlayer.playWhenReady = true
                 }
             )
-            IconButton(
-                onClick = { isFullscreen = !isFullscreen },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(10.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(50))
-            ) {
-                Icon(
-                    imageVector = if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
-                    contentDescription = "Fullscreen",
-                    tint = Color.White
+        } else {
+            Box(modifier = Modifier.fillMaxSize()) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            layoutParams = FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT
+                            )
+                            player = exoPlayer
+                            useController = true
+                        }
+                    },
+                    update = { it.player = exoPlayer }
                 )
+                IconButton(
+                    onClick = { isFullscreen = !isFullscreen },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(10.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(50))
+                ) {
+                    Icon(
+                        imageVector = if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+                        contentDescription = "Fullscreen",
+                        tint = Color.White
+                    )
+                }
             }
         }
     }

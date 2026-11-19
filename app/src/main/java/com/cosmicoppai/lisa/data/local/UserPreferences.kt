@@ -9,6 +9,8 @@ import com.cosmicoppai.lisa.model.DownloadFormat
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -19,8 +21,12 @@ data class LisaSettings(
     val preferredAudio: String = "jpn",
     val preferredQuality: Int = 1080,
     val preferredMangaFormat: DownloadFormat = DownloadFormat.JPG,
-    val animepaheBaseUrl: String = "https://animepahe.com"
-)
+    val animepaheBaseUrl: String = DEFAULT_ANIMEPAHE_URL
+) {
+    companion object {
+        const val DEFAULT_ANIMEPAHE_URL = "https://animepahe.pw"
+    }
+}
 
 @Singleton
 class UserPreferences @Inject constructor(
@@ -35,6 +41,13 @@ class UserPreferences @Inject constructor(
     }
 
     val settings: Flow<LisaSettings> = context.dataStore.data.map { prefs ->
+        val rawBaseUrl = prefs[Keys.ANIMEPAHE_BASE_URL]?.trimEnd('/')
+        val migratedBaseUrl = when {
+            rawBaseUrl.isNullOrBlank() -> LisaSettings.DEFAULT_ANIMEPAHE_URL
+            rawBaseUrl.equals("https://animepahe.ru", ignoreCase = true) ||
+                rawBaseUrl.equals("http://animepahe.ru", ignoreCase = true) -> LisaSettings.DEFAULT_ANIMEPAHE_URL
+            else -> normalizeBaseUrl(rawBaseUrl) ?: LisaSettings.DEFAULT_ANIMEPAHE_URL
+        }
         LisaSettings(
             appMode = prefs[Keys.APP_MODE]?.let { runCatching { AppMode.valueOf(it) }.getOrNull() }
                 ?: AppMode.ANIME,
@@ -43,7 +56,7 @@ class UserPreferences @Inject constructor(
             preferredMangaFormat = prefs[Keys.MANGA_FORMAT]?.let {
                 runCatching { DownloadFormat.valueOf(it) }.getOrNull()
             } ?: DownloadFormat.JPG,
-            animepaheBaseUrl = prefs[Keys.ANIMEPAHE_BASE_URL] ?: "https://animepahe.com"
+            animepaheBaseUrl = migratedBaseUrl
         )
     }
 
@@ -64,6 +77,25 @@ class UserPreferences @Inject constructor(
     }
 
     suspend fun setAnimepaheBaseUrl(url: String) {
-        context.dataStore.edit { it[Keys.ANIMEPAHE_BASE_URL] = url.trimEnd('/') }
+        val normalized = normalizeBaseUrl(url) ?: return
+        context.dataStore.edit { it[Keys.ANIMEPAHE_BASE_URL] = normalized }
+    }
+
+    companion object {
+        fun normalizeBaseUrl(raw: String): String? {
+            val trimmed = raw.trim().trimEnd('/')
+            if (trimmed.isEmpty()) return null
+            val withScheme = if (trimmed.startsWith("http://", ignoreCase = true) ||
+                trimmed.startsWith("https://", ignoreCase = true)
+            ) {
+                trimmed
+            } else {
+                "https://$trimmed"
+            }
+            val parsed = withScheme.toHttpUrlOrNull() ?: return null
+            if (parsed.host.isBlank() || !parsed.host.contains('.')) return null
+            val portSuffix = if (parsed.port != HttpUrl.defaultPort(parsed.scheme)) ":${parsed.port}" else ""
+            return "${parsed.scheme}://${parsed.host}$portSuffix"
+        }
     }
 }

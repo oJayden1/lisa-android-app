@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
@@ -24,11 +24,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
@@ -40,6 +36,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import com.cosmicoppai.lisa.R
+import com.cosmicoppai.lisa.data.remote.InteractiveCaptchaException
 import com.cosmicoppai.lisa.data.repository.MediaRepository
 import com.cosmicoppai.lisa.model.AnimeSearchItem
 import com.cosmicoppai.lisa.model.AppMode
@@ -56,16 +53,20 @@ import com.cosmicoppai.lisa.ui.theme.LisaSurface
 import com.cosmicoppai.lisa.ui.theme.LisaTextPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaTextSecondary
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.launchIn
-import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -76,7 +77,9 @@ data class SearchUiState(
     val animeResults: List<AnimeSearchItem> = emptyList(),
     val mangaResults: List<MangaSearchItem> = emptyList(),
     val hasSearched: Boolean = false,
-    val error: String? = null
+    val error: String? = null,
+    val requiresVerification: Boolean = false,
+    val verificationSiteUrl: String = ""
 )
 
 @OptIn(FlowPreview::class)
@@ -86,35 +89,41 @@ class SearchViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val queryFlow = MutableStateFlow("")
+    private val retryNonce = MutableStateFlow(0)
     private val _uiState = MutableStateFlow(SearchUiState())
     val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
 
-    val appMode: StateFlow<AppMode> = MutableStateFlow(AppMode.ANIME).also { flow ->
-        viewModelScope.launch {
-            repository.settings.collect { flow.value = it.appMode }
-        }
-    }
+    private val distinctAppModeFlow = repository.settings
+        .map { it.appMode }
+        .distinctUntilChanged()
+
+    val appMode: StateFlow<AppMode> = distinctAppModeFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AppMode.ANIME)
 
     init {
-        combine(
-            queryFlow.debounce(450).distinctUntilChanged(),
-            repository.settings
-        ) { q, settings -> q.trim() to settings.appMode }
-            .onEach { (trimmed, mode) ->
-                if (trimmed.isEmpty()) {
-                    _uiState.value = _uiState.value.copy(
-                        isLoading = false,
-                        takingLonger = false,
-                        animeResults = emptyList(),
-                        mangaResults = emptyList(),
-                        hasSearched = false,
-                        error = null
-                    )
-                } else {
-                    performSearch(trimmed, mode)
+        viewModelScope.launch {
+            combine(
+                queryFlow.debounce(450).map { it.trim() }.distinctUntilChanged(),
+                distinctAppModeFlow,
+                retryNonce
+            ) { trimmed, mode, _ -> trimmed to mode }
+                .collectLatest { (trimmed, mode) ->
+                    if (trimmed.isEmpty()) {
+                        _uiState.value = _uiState.value.copy(
+                            isLoading = false,
+                            takingLonger = false,
+                            animeResults = emptyList(),
+                            mangaResults = emptyList(),
+                            hasSearched = false,
+                            error = null,
+                            requiresVerification = false,
+                            verificationSiteUrl = ""
+                        )
+                    } else {
+                        performSearch(trimmed, mode)
+                    }
                 }
-            }
-            .launchIn(viewModelScope)
+        }
     }
 
     fun onQueryChanged(value: String) {
@@ -127,34 +136,46 @@ class SearchViewModel @Inject constructor(
     }
 
     fun retry() {
-        val currentQuery = _uiState.value.query.trim()
-        if (currentQuery.isNotEmpty()) {
-            viewModelScope.launch {
-                performSearch(currentQuery, appMode.value)
+        if (_uiState.value.query.trim().isNotEmpty()) {
+            retryNonce.value += 1
+        }
+    }
+
+    fun verifyAndRetry() {
+        val siteUrl = _uiState.value.verificationSiteUrl.takeIf { it.isNotBlank() }
+        repository.requestAnimepaheVerification(siteUrl) { passed ->
+            if (passed) {
+                _uiState.value = _uiState.value.copy(
+                    error = null,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
+                )
+                retry()
             }
         }
     }
 
-    private suspend fun performSearch(query: String, mode: AppMode) {
+    private suspend fun performSearch(query: String, mode: AppMode) = coroutineScope {
         _uiState.value = _uiState.value.copy(
             isLoading = true,
             takingLonger = false,
-            error = null
+            error = null,
+            requiresVerification = false,
+            verificationSiteUrl = ""
         )
 
-        val slowTimer = viewModelScope.launch {
+        val slowTimer = launch {
             delay(5_000L)
             if (_uiState.value.isLoading) {
                 _uiState.value = _uiState.value.copy(takingLonger = true)
             }
         }
 
-        runCatching {
-            when (mode) {
+        try {
+            val (anime, manga) = when (mode) {
                 AppMode.ANIME -> repository.searchAnime(query) to emptyList<MangaSearchItem>()
                 AppMode.MANGA -> emptyList<AnimeSearchItem>() to repository.searchManga(query).results
             }
-        }.onSuccess { (anime, manga) ->
             slowTimer.cancel()
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
@@ -162,15 +183,23 @@ class SearchViewModel @Inject constructor(
                 animeResults = anime,
                 mangaResults = manga,
                 hasSearched = true,
-                error = null
+                error = null,
+                requiresVerification = false,
+                verificationSiteUrl = ""
             )
-        }.onFailure { err ->
+        } catch (e: CancellationException) {
             slowTimer.cancel()
+            throw e
+        } catch (err: Throwable) {
+            slowTimer.cancel()
+            val captcha = err as? InteractiveCaptchaException
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
                 takingLonger = false,
                 hasSearched = true,
-                error = err.message ?: "Search failed"
+                error = err.message ?: "Search failed",
+                requiresVerification = captcha != null,
+                verificationSiteUrl = captcha?.siteUrl.orEmpty()
             )
         }
     }
@@ -259,7 +288,12 @@ fun SearchScreen(
                 LisaLoadingView(msg)
             }
             state.error != null -> {
-                LisaErrorView(message = state.error!!, onRetry = viewModel::retry)
+                LisaErrorView(
+                    message = state.error!!,
+                    onRetry = viewModel::retry,
+                    secondaryActionLabel = if (state.requiresVerification) "Verify & Retry" else null,
+                    onSecondaryAction = if (state.requiresVerification) viewModel::verifyAndRetry else null
+                )
             }
             state.hasSearched && mode == AppMode.ANIME && state.animeResults.isEmpty() -> {
                 LisaNotFoundView(
@@ -281,7 +315,10 @@ fun SearchScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    items(state.animeResults, key = { it.session }) { item ->
+                    itemsIndexed(
+                        items = state.animeResults,
+                        key = { idx, item -> "anime_${item.session}_$idx" }
+                    ) { _, item ->
                         AnimePosterCard(item = item, onClick = { onOpenAnime(item) })
                     }
                 }
@@ -294,7 +331,10 @@ fun SearchScreen(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    items(state.mangaResults, key = { it.session }) { item ->
+                    itemsIndexed(
+                        items = state.mangaResults,
+                        key = { idx, item -> "manga_${item.session}_$idx" }
+                    ) { _, item ->
                         MangaPosterCard(item = item, onClick = { onOpenManga(item) })
                     }
                 }

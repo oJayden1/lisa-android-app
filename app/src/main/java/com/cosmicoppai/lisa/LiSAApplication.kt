@@ -10,6 +10,9 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import coil.decode.GifDecoder
 import coil.decode.ImageDecoderDecoder
+import coil.disk.DiskCache
+import coil.memory.MemoryCache
+import com.cosmicoppai.lisa.di.CoilClient
 import dagger.hilt.android.HiltAndroidApp
 import okhttp3.OkHttpClient
 import javax.inject.Inject
@@ -21,7 +24,8 @@ class LiSAApplication : Application(), Configuration.Provider, ImageLoaderFactor
     lateinit var workerFactory: HiltWorkerFactory
 
     @Inject
-    lateinit var okHttpClient: OkHttpClient
+    @CoilClient
+    lateinit var coilOkHttpClient: OkHttpClient
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder()
@@ -35,7 +39,19 @@ class LiSAApplication : Application(), Configuration.Provider, ImageLoaderFactor
 
     override fun newImageLoader(): ImageLoader {
         return ImageLoader.Builder(this)
-            .okHttpClient(okHttpClient)
+            .okHttpClient(coilOkHttpClient)
+            .allowHardware(false)
+            .memoryCache {
+                MemoryCache.Builder(this)
+                    .maxSizePercent(0.25)
+                    .build()
+            }
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(cacheDir.resolve("coil_image_cache"))
+                    .maxSizeBytes(150L * 1024L * 1024L)
+                    .build()
+            }
             .components {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     add(ImageDecoderDecoder.Factory())

@@ -11,8 +11,8 @@ object KwikJsUnpacker {
     private val whitespaceRegex = Regex("""\s+""")
     private val packedRegex = Regex("""returnp\}\('(.*?)',(\d*),(\d*),'(.*?)'\.split""")
     private val titleRegex = Regex("""<title>(.*?)</title>""", RegexOption.IGNORE_CASE)
-    private val streamRegex = Regex("""https://[^\s'"\\]+(?:owo|uwu)\.m3u8""")
-    private val fallbackM3u8Regex = Regex("""https://[^\s'"\\]+\.m3u8""")
+    private val streamRegex = Regex("""https://[^\s'"\\)]+(?:owo|uwu)\.m3u8(?:\?[^\s'"\\)]*)?""")
+    private val fallbackM3u8Regex = Regex("""https://[^\s'"\\)]+\.m3u8(?:\?[^\s'"\\)]*)?""")
 
     fun extractFromHtml(html: String): KwikStreamResult {
         val minified = whitespaceRegex.replace(html, "").trim()
@@ -21,18 +21,25 @@ object KwikJsUnpacker {
             ?: "AnimePahe_Episode.mp4"
 
         val matches = packedRegex.findAll(minified).toList()
-        require(matches.isNotEmpty()) { "Unable to locate packed Kwik script in response" }
+        val manifestUrl = if (matches.isNotEmpty()) {
+            matches.asReversed().firstNotNullOfOrNull { match ->
+                val p = match.groupValues[1]
+                val a = match.groupValues[2].toIntOrNull() ?: return@firstNotNullOfOrNull null
+                val c = match.groupValues[3].toIntOrNull() ?: return@firstNotNullOfOrNull null
+                val k = match.groupValues[4]
+                if (a <= 0 || a > DIGITS.length) return@firstNotNullOfOrNull null
 
-        val lastMatch = matches.last()
-        val p = lastMatch.groupValues[1]
-        val a = lastMatch.groupValues[2].toInt()
-        val c = lastMatch.groupValues[3].toInt()
-        val k = lastMatch.groupValues[4]
-
-        val unpacked = unpack(p, a, c, k)
-        val manifestUrl = streamRegex.find(unpacked)?.value
-            ?: fallbackM3u8Regex.find(unpacked)?.value
-            ?: error("Unable to extract .m3u8 manifest URL from unpacked Kwik script")
+                val unpacked = unpack(p, a, c, k)
+                streamRegex.find(unpacked)?.value ?: fallbackM3u8Regex.find(unpacked)?.value
+            }
+                ?: streamRegex.find(html)?.value
+                ?: fallbackM3u8Regex.find(html)?.value
+                ?: error("Unable to extract .m3u8 manifest URL from unpacked Kwik script")
+        } else {
+            streamRegex.find(html)?.value
+                ?: fallbackM3u8Regex.find(html)?.value
+                ?: throw IllegalArgumentException("Unable to locate packed Kwik script in response")
+        }
 
         return KwikStreamResult(
             fileName = title,

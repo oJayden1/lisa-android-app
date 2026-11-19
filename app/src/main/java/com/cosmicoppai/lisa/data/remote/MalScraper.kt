@@ -54,7 +54,9 @@ class MalScraper @Inject constructor(
         }
 
         val page = parseTopHtml(html, media, offset)
-        cache[key] = page
+        if (page.items.isNotEmpty()) {
+            cache[key] = page
+        }
         return page
     }
 
@@ -68,8 +70,12 @@ class MalScraper @Inject constructor(
             }
         }
 
-        var imgs = doc.select("img[width=50][height=70]").map { img ->
-            val src = img.attr("data-src").ifBlank { img.attr("src") }
+        var imgs = doc.select("img[width=50][height=70]").ifEmpty {
+            doc.select("tr.ranking-list img")
+        }.map { img ->
+            val src = img.attr("data-src")
+                .ifBlank { img.attr("data-lazy-src") }
+                .ifBlank { img.attr("src") }
             stripMalImageResize(src)
         }
         if (imgs.isEmpty()) {
@@ -139,10 +145,16 @@ class MalScraper @Inject constructor(
     private fun stripMalImageResize(src: String): String {
         val rIdx = src.indexOf("/r/")
         val iIdx = src.indexOf("/images/")
-        return if (rIdx >= 0 && iIdx > rIdx) {
+        val withoutResize = if (rIdx >= 0 && iIdx > rIdx) {
             src.removeRange(rIdx, iIdx)
         } else {
             src
+        }
+        // MAL HMAC '?s=' query signatures are bound to the '/r/WxH' path and fail when '/r/WxH' is stripped.
+        return if (rIdx >= 0 && iIdx > rIdx) {
+            withoutResize.substringBefore("?s=").substringBefore("&s=")
+        } else {
+            withoutResize
         }
     }
 

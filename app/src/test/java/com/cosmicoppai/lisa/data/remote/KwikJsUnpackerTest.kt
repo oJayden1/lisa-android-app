@@ -35,4 +35,41 @@ class KwikJsUnpackerTest {
         assertEquals("https://cdn.example.com/hls/1080/uwu.m3u8", result.manifestUrl)
         assertTrue(result.manifestUrl.endsWith("uwu.m3u8"))
     }
+
+    @Test
+    fun `extractFromHtml preserves query string and extracts direct DOM m3u8 fallback`() {
+        val html = """
+            <html>
+            <head><title>Episode 01</title></head>
+            <body><video><source src="https://vault-01.uwucdn.top/stream/ep1/uwu.m3u8?token=xyz123" /></video></body>
+            </html>
+        """.trimIndent()
+        val result = KwikJsUnpacker.extractFromHtml(html)
+        assertEquals("https://vault-01.uwucdn.top/stream/ep1/uwu.m3u8?token=xyz123", result.manifestUrl)
+    }
+
+    @Test
+    fun `extractFromHtml skips trailing unrelated packed script and unpacks earlier m3u8 block`() {
+        val streamPayload = "0 1='2://3.4.5/6/7.8';"
+        val streamKeywords = "var|source|https|cdn|example|com|ep2|uwu|m3u8"
+        val noisePayload = "0.1('2 3');"
+        val noiseKeywords = "console|log|analytics|loaded"
+        val html = """
+            <html>
+            <head><title>Episode 02</title></head>
+            <body>
+            <script>
+            eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\b'+c.toString(a)+'\\b','g'),k[c]);return p}('$streamPayload',10,9,'$streamKeywords'.split('|'),0,{}))
+            </script>
+            <script>
+            eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\b'+c.toString(a)+'\\b','g'),k[c]);return p}('$noisePayload',10,4,'$noiseKeywords'.split('|'),0,{}))
+            </script>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val result = KwikJsUnpacker.extractFromHtml(html)
+        assertEquals("Episode 02", result.fileName)
+        assertEquals("https://cdn.example.com/ep2/uwu.m3u8", result.manifestUrl)
+    }
 }

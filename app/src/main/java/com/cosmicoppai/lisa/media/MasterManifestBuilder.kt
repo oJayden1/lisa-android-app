@@ -29,18 +29,26 @@ class MasterManifestBuilder @Inject constructor(
         audio: String,
         cacheKey: String
     ): PreparedAnimeStream = coroutineScope {
-        val variants = streamOptions.map { option ->
+        val settled = streamOptions.map { option ->
             async {
-                val res = option.resolution.filter { it.isDigit() }.toIntOrNull() ?: 720
-                val kwik = animepaheScraper.getHlsPlaylist(option.kwikUrl)
-                ResolvedStreamVariant(
-                    resolution = res,
-                    audio = audio,
-                    manifestUrl = kwik.manifestUrl,
-                    fileName = kwik.fileName
-                )
+                runCatching {
+                    val res = option.resolution.filter { it.isDigit() }.toIntOrNull() ?: 720
+                    val kwik = animepaheScraper.getHlsPlaylist(option.kwikUrl)
+                    ResolvedStreamVariant(
+                        resolution = res,
+                        audio = audio,
+                        manifestUrl = kwik.manifestUrl,
+                        fileName = kwik.fileName
+                    )
+                }
             }
-        }.awaitAll().sortedByDescending { it.resolution }
+        }.awaitAll()
+
+        val variants = settled.mapNotNull { it.getOrNull() }.sortedByDescending { it.resolution }
+        if (variants.isEmpty()) {
+            val firstError = settled.firstNotNullOfOrNull { it.exceptionOrNull() }
+            throw firstError ?: IllegalStateException("No playable stream variants found")
+        }
 
         val manifestContent = buildMasterManifestText(variants)
         val manifestDir = File(context.cacheDir, "manifests").apply { mkdirs() }

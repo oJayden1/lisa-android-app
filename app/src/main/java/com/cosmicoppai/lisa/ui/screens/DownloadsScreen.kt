@@ -261,23 +261,23 @@ fun DownloadsScreen(
                                         }
                                         if (item.outputFormat != DownloadFormat.JPG && !item.fileLocation.isNullOrBlank()) {
                                             IconButton(onClick = {
-                                                val file = File(item.fileLocation)
-                                                if (file.exists()) {
-                                                    val uri = FileProvider.getUriForFile(
-                                                        context,
-                                                        "${context.packageName}.fileprovider",
-                                                        file
-                                                    )
-                                                    val mime = if (item.outputFormat == DownloadFormat.PDF) {
-                                                        "application/pdf"
-                                                    } else {
-                                                        "video/mp4"
-                                                    }
-                                                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                                                        setDataAndType(uri, mime)
-                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                    }
-                                                    runCatching {
+                                                runCatching {
+                                                    val file = File(item.fileLocation)
+                                                    if (file.exists()) {
+                                                        val uri = FileProvider.getUriForFile(
+                                                            context,
+                                                            "${context.packageName}.fileprovider",
+                                                            file
+                                                        )
+                                                        val mime = if (item.outputFormat == DownloadFormat.PDF) {
+                                                            "application/pdf"
+                                                        } else {
+                                                            "video/*"
+                                                        }
+                                                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                                                            setDataAndType(uri, mime)
+                                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                        }
                                                         context.startActivity(Intent.createChooser(intent, "Open with"))
                                                     }
                                                 }
