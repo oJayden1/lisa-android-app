@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Rational
 import android.view.ViewGroup
@@ -29,7 +30,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
@@ -48,14 +49,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,6 +74,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultDataSource
@@ -84,6 +84,8 @@ import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import com.cosmicoppai.lisa.data.remote.AnimepaheScraper
+import com.cosmicoppai.lisa.data.remote.CloudflareCookieResolver
+import com.cosmicoppai.lisa.data.remote.InteractiveCaptchaException
 import com.cosmicoppai.lisa.data.repository.MediaRepository
 import com.cosmicoppai.lisa.media.PreparedAnimeStream
 import com.cosmicoppai.lisa.model.AnimeEpisode
@@ -97,9 +99,12 @@ import com.cosmicoppai.lisa.ui.theme.LisaBorder
 import com.cosmicoppai.lisa.ui.theme.LisaPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaSurface
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import javax.inject.Inject
@@ -115,28 +120,45 @@ data class AnimePlayerUiState(
     val selectedAudio: String = "jpn",
     val preparedStream: PreparedAnimeStream? = null,
     val selectedQualityHeight: Int? = null,
+    val playbackLoadId: Int = 0,
     val isLoading: Boolean = true,
     val message: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val requiresVerification: Boolean = false,
+    val verificationSiteUrl: String = ""
 )
 
 @HiltViewModel
 class AnimePlayerViewModel @Inject constructor(
     private val repository: MediaRepository,
-    val okHttpClient: OkHttpClient
+    val okHttpClient: OkHttpClient,
+    val cookieResolver: CloudflareCookieResolver
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(AnimePlayerUiState())
     val uiState: StateFlow<AnimePlayerUiState> = _uiState.asStateFlow()
 
+    private var streamJob: Job? = null
+    private var pageJob: Job? = null
+    private var preferredQualitySetting: Int? = null
+    private var userExplicitQualityChoice: Boolean = false
+
     fun initAndLoad(anime: AnimeSearchItem, episode: AnimeEpisode, page: Int) {
-        viewModelScope.launch {
+        streamJob?.cancel()
+        streamJob = viewModelScope.launch {
+            val settings = repository.settings.first()
+            preferredQualitySetting = settings.preferredQuality.takeIf { it > 0 }
+            userExplicitQualityChoice = false
             _uiState.value = _uiState.value.copy(
                 anime = anime,
                 currentEpisode = episode,
                 currentPage = page,
+                selectedAudio = settings.preferredAudio,
+                selectedQualityHeight = preferredQualitySetting,
                 isLoading = true,
-                error = null
+                error = null,
+                requiresVerification = false,
+                verificationSiteUrl = ""
             )
             loadEpisodePage(anime.session, page)
             loadEpisodeStream(anime.session, episode)
@@ -144,27 +166,34 @@ class AnimePlayerViewModel @Inject constructor(
     }
 
     fun loadEpisodePage(animeSession: String, page: Int) {
-        viewModelScope.launch {
-            runCatching {
-                repository.getAnimeDetails(animeSession, page)
-            }.onSuccess { details ->
+        pageJob?.cancel()
+        pageJob = viewModelScope.launch {
+            try {
+                val details = repository.getAnimeDetails(animeSession, page)
                 _uiState.value = _uiState.value.copy(
                     pageEpisodes = details.episodes,
                     currentPage = details.currentPage,
                     hasNextPage = details.hasNextPage,
                     hasPrevPage = details.hasPrevPage
                 )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // Keep existing page list on transient pagination failure
             }
         }
     }
 
     fun selectEpisode(episode: AnimeEpisode) {
         val anime = _uiState.value.anime ?: return
-        viewModelScope.launch {
+        streamJob?.cancel()
+        streamJob = viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 currentEpisode = episode,
                 isLoading = true,
                 error = null,
+                requiresVerification = false,
+                verificationSiteUrl = "",
                 preparedStream = null
             )
             loadEpisodeStream(anime.session, episode)
@@ -175,28 +204,127 @@ class AnimePlayerViewModel @Inject constructor(
         val anime = _uiState.value.anime ?: return
         val episode = _uiState.value.currentEpisode ?: return
         val options = _uiState.value.streamOptionsByAudio[audio] ?: return
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(selectedAudio = audio, isLoading = true, error = null)
-            runCatching {
-                repository.prepareAnimeStream(options, audio, "${anime.session}_${episode.epSession}")
-            }.onSuccess { prepared ->
-                _uiState.value = _uiState.value.copy(preparedStream = prepared, isLoading = false)
-            }.onFailure { err ->
-                _uiState.value = _uiState.value.copy(isLoading = false, error = err.message)
+        streamJob?.cancel()
+        streamJob = viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                selectedAudio = audio,
+                isLoading = true,
+                error = null,
+                requiresVerification = false,
+                verificationSiteUrl = ""
+            )
+            try {
+                val prepared = repository.prepareAnimeStream(options, audio, "${anime.session}_${episode.epSession}")
+                val resolvedQuality = resolveQualityForVariants(
+                    variants = prepared.variants,
+                    current = _uiState.value.selectedQualityHeight
+                )
+                _uiState.value = _uiState.value.copy(
+                    preparedStream = prepared,
+                    selectedQualityHeight = resolvedQuality,
+                    playbackLoadId = _uiState.value.playbackLoadId + 1,
+                    isLoading = false,
+                    error = null,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
+                val captcha = err as? InteractiveCaptchaException
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    error = err.message ?: "Failed to switch audio",
+                    requiresVerification = captcha != null,
+                    verificationSiteUrl = captcha?.siteUrl.orEmpty()
+                )
             }
         }
     }
 
     fun selectQuality(height: Int?) {
-        _uiState.value = _uiState.value.copy(selectedQualityHeight = height)
+        userExplicitQualityChoice = true
+        _uiState.value = _uiState.value.copy(
+            selectedQualityHeight = height,
+            error = null
+        )
+    }
+
+    fun reportPlaybackError(errorMessage: String) {
+        _uiState.value = _uiState.value.copy(
+            isLoading = false,
+            error = errorMessage,
+            requiresVerification = false,
+            verificationSiteUrl = ""
+        )
+    }
+
+    fun verifyAndRetry() {
+        val siteUrl = _uiState.value.verificationSiteUrl.takeIf { it.isNotBlank() }
+        val episode = _uiState.value.currentEpisode ?: return
+        repository.requestAnimepaheVerification(siteUrl) { passed ->
+            if (passed) {
+                _uiState.value = _uiState.value.copy(
+                    error = null,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
+                )
+                selectEpisode(episode)
+            }
+        }
     }
 
     fun playNextEpisode(): Boolean {
-        val list = _uiState.value.pageEpisodes
-        val current = _uiState.value.currentEpisode ?: return false
+        val state = _uiState.value
+        val anime = state.anime ?: return false
+        val list = state.pageEpisodes
+        val current = state.currentEpisode ?: return false
         val idx = list.indexOfFirst { it.epSession == current.epSession }
         if (idx >= 0 && idx + 1 < list.size) {
             selectEpisode(list[idx + 1])
+            return true
+        }
+        if (state.hasNextPage) {
+            val nextPage = state.currentPage + 1
+            pageJob?.cancel()
+            streamJob?.cancel()
+            streamJob = viewModelScope.launch {
+                _uiState.value = _uiState.value.copy(
+                    isLoading = true,
+                    error = null,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
+                )
+                try {
+                    val details = repository.getAnimeDetails(anime.session, nextPage)
+                    val firstEp = details.episodes.firstOrNull()
+                    _uiState.value = _uiState.value.copy(
+                        pageEpisodes = details.episodes,
+                        currentPage = details.currentPage,
+                        hasNextPage = details.hasNextPage,
+                        hasPrevPage = details.hasPrevPage
+                    )
+                    if (firstEp != null) {
+                        _uiState.value = _uiState.value.copy(
+                            currentEpisode = firstEp,
+                            preparedStream = null
+                        )
+                        loadEpisodeStream(anime.session, firstEp)
+                    } else {
+                        _uiState.value = _uiState.value.copy(isLoading = false)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (err: Throwable) {
+                    val captcha = err as? InteractiveCaptchaException
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        error = err.message ?: "Failed to load next episode page",
+                        requiresVerification = captcha != null,
+                        verificationSiteUrl = captcha?.siteUrl.orEmpty()
+                    )
+                }
+            }
             return true
         }
         return false
@@ -224,7 +352,7 @@ class AnimePlayerViewModel @Inject constructor(
     }
 
     private suspend fun loadEpisodeStream(animeSession: String, episode: AnimeEpisode) {
-        runCatching {
+        try {
             val map = repository.getStreamOptions(animeSession, episode.epSession)
             val chosenAudio = if (map.containsKey(_uiState.value.selectedAudio)) {
                 _uiState.value.selectedAudio
@@ -237,21 +365,47 @@ class AnimePlayerViewModel @Inject constructor(
             } else {
                 null
             }
-            Triple(map, chosenAudio, prepared)
-        }.onSuccess { (map, chosenAudio, prepared) ->
+            val resolvedQuality = prepared?.let {
+                resolveQualityForVariants(
+                    variants = it.variants,
+                    current = if (userExplicitQualityChoice) _uiState.value.selectedQualityHeight else preferredQualitySetting
+                )
+            }
             _uiState.value = _uiState.value.copy(
                 streamOptionsByAudio = map,
                 selectedAudio = chosenAudio,
                 preparedStream = prepared,
+                selectedQualityHeight = resolvedQuality,
+                playbackLoadId = _uiState.value.playbackLoadId + 1,
                 isLoading = false,
-                error = if (prepared == null) "No playable streams returned" else null
+                error = if (prepared == null) "No playable streams returned" else null,
+                requiresVerification = false,
+                verificationSiteUrl = ""
             )
-        }.onFailure { err ->
+        } catch (e: CancellationException) {
+            throw e
+        } catch (err: Throwable) {
+            val captcha = err as? InteractiveCaptchaException
             _uiState.value = _uiState.value.copy(
                 isLoading = false,
-                error = err.message ?: "Failed to load stream"
+                error = err.message ?: "Failed to load stream",
+                requiresVerification = captcha != null,
+                verificationSiteUrl = captcha?.siteUrl.orEmpty()
             )
         }
+    }
+
+    private fun resolveQualityForVariants(
+        variants: List<ResolvedStreamVariant>,
+        current: Int?
+    ): Int? {
+        if (current == null || variants.isEmpty()) return null
+        if (variants.any { it.resolution == current }) return current
+        return variants
+            .filter { it.resolution <= current }
+            .maxByOrNull { it.resolution }
+            ?.resolution
+            ?: variants.maxByOrNull { it.resolution }?.resolution
     }
 
     fun clearMessage() {
@@ -298,13 +452,18 @@ fun AnimePlayerScreen(
         }
         onDispose {
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            activity?.window?.let { win ->
+                WindowCompat.getInsetsController(win, win.decorView)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
         }
     }
 
     val trackSelector = remember(context) { DefaultTrackSelector(context) }
     val exoPlayer = remember(context) {
+        val headers = AnimepaheScraper.KWIK_HEADERS + ("User-Agent" to viewModel.cookieResolver.cachedUserAgent)
         val okHttpFactory = OkHttpDataSource.Factory(viewModel.okHttpClient)
-            .setDefaultRequestProperties(AnimepaheScraper.KWIK_HEADERS)
+            .setDefaultRequestProperties(headers)
         val dataSourceFactory = DefaultDataSource.Factory(context, okHttpFactory)
         ExoPlayer.Builder(context)
             .setTrackSelector(trackSelector)
@@ -320,6 +479,13 @@ fun AnimePlayerScreen(
                     viewModel.playNextEpisode()
                 }
             }
+
+            override fun onPlayerError(error: PlaybackException) {
+                val msg = error.cause?.message?.takeIf { it.isNotBlank() }
+                    ?: error.message?.takeIf { it.isNotBlank() }
+                    ?: "Stream playback failed (${error.errorCodeName})"
+                viewModel.reportPlaybackError(msg)
+            }
         }
         exoPlayer.addListener(listener)
         onDispose {
@@ -329,27 +495,24 @@ fun AnimePlayerScreen(
     }
 
     val prepared = state.preparedStream
-    LaunchedEffect(prepared?.masterManifestUri) {
-        val uri = prepared?.masterManifestUri ?: return@LaunchedEffect
-        val mediaItem = MediaItem.fromUri(uri)
+    LaunchedEffect(prepared, state.selectedQualityHeight, state.playbackLoadId) {
+        val stream = prepared ?: return@LaunchedEffect
+        val targetUri = state.selectedQualityHeight?.let { height ->
+            stream.variants.firstOrNull { it.resolution == height }?.manifestUrl?.let { Uri.parse(it) }
+        } ?: stream.masterManifestUri
+
+        // Clear any size constraints so non-16:9 / cinemascope encodes never drop video tracks.
+        trackSelector.parameters = trackSelector.buildUponParameters()
+            .clearVideoSizeConstraints()
+            .build()
+
+        val mediaItem = MediaItem.fromUri(targetUri)
         exoPlayer.setMediaItem(mediaItem)
         exoPlayer.prepare()
         if (resumePositionMs > 0) {
             exoPlayer.seekTo(resumePositionMs)
         }
         exoPlayer.playWhenReady = true
-    }
-
-    LaunchedEffect(state.selectedQualityHeight) {
-        val h = state.selectedQualityHeight
-        trackSelector.parameters = if (h == null) {
-            trackSelector.buildUponParameters().clearVideoSizeConstraints().build()
-        } else {
-            trackSelector.buildUponParameters()
-                .setMaxVideoSize(Int.MAX_VALUE, h)
-                .setMinVideoSize(0, h)
-                .build()
-        }
     }
 
     LaunchedEffect(playbackSpeed) {
@@ -367,17 +530,28 @@ fun AnimePlayerScreen(
                 subtitle = "Episode ${state.currentEpisode?.epNo ?: initialEpisode.epNo}",
                 onBack = onBack,
                 actions = {
-                    IconButton(onClick = {
-                        activity?.enterPictureInPictureMode(
-                            PictureInPictureParams.Builder()
-                                .setAspectRatio(Rational(16, 9))
-                                .build()
-                        )
-                    }) {
-                        Icon(Icons.Filled.PictureInPictureAlt, contentDescription = "PiP", tint = Color.White)
+                    val supportsPip = remember(activity) {
+                        activity?.packageManager?.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE) == true
+                    }
+                    if (supportsPip) {
+                        IconButton(onClick = {
+                            runCatching {
+                                activity?.enterPictureInPictureMode(
+                                    PictureInPictureParams.Builder()
+                                        .setAspectRatio(Rational(16, 9))
+                                        .build()
+                                )
+                            }
+                        }) {
+                            Icon(Icons.Filled.PictureInPictureAlt, contentDescription = "PiP", tint = Color.White)
+                        }
                     }
                     IconButton(onClick = {
-                        val variantUrl = prepared?.variants?.firstOrNull()?.manifestUrl ?: return@IconButton
+                        val variantUrl = prepared?.variants?.firstOrNull {
+                            it.resolution == state.selectedQualityHeight
+                        }?.manifestUrl
+                            ?: prepared?.variants?.firstOrNull()?.manifestUrl
+                            ?: return@IconButton
                         val intent = Intent(Intent.ACTION_VIEW).apply {
                             setDataAndType(Uri.parse(variantUrl), "application/x-mpegURL")
                         }
@@ -452,7 +626,15 @@ fun AnimePlayerScreen(
                     state.isLoading -> LisaLoadingView("Resolving video stream...")
                     state.error != null -> LisaErrorView(
                         message = state.error!!,
-                        onRetry = { state.currentEpisode?.let { viewModel.selectEpisode(it) } }
+                        onRetry = {
+                            resumePositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                            state.currentEpisode?.let { viewModel.selectEpisode(it) }
+                        },
+                        secondaryActionLabel = if (state.requiresVerification) "Verify & Retry" else null,
+                        onSecondaryAction = if (state.requiresVerification) ({
+                            resumePositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                            viewModel.verifyAndRetry()
+                        }) else null
                     )
                 }
 
@@ -464,7 +646,7 @@ fun AnimePlayerScreen(
                         FilterChip(
                             selected = state.selectedAudio == audio,
                             onClick = {
-                                resumePositionMs = exoPlayer.currentPosition
+                                resumePositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
                                 viewModel.selectAudio(audio)
                             },
                             label = {
@@ -481,6 +663,7 @@ fun AnimePlayerScreen(
                             DropdownMenuItem(
                                 text = { Text("Auto") },
                                 onClick = {
+                                    resumePositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
                                     viewModel.selectQuality(null)
                                     showQualityMenu = false
                                 }
@@ -489,6 +672,7 @@ fun AnimePlayerScreen(
                                 DropdownMenuItem(
                                     text = { Text("${v.resolution}p") },
                                     onClick = {
+                                        resumePositionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
                                         viewModel.selectQuality(v.resolution)
                                         showQualityMenu = false
                                     }
@@ -554,7 +738,10 @@ fun AnimePlayerScreen(
                     contentPadding = PaddingValues(bottom = 16.dp),
                     modifier = Modifier.weight(1f)
                 ) {
-                    items(state.pageEpisodes, key = { it.epSession }) { ep ->
+                    itemsIndexed(
+                        items = state.pageEpisodes,
+                        key = { idx, ep -> "${state.currentPage}_${ep.epSession}_$idx" }
+                    ) { _, ep ->
                         val isCurrent = ep.epSession == state.currentEpisode?.epSession
                         Card(
                             shape = RoundedCornerShape(10.dp),

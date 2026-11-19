@@ -1,5 +1,6 @@
 package com.cosmicoppai.lisa.ui.screens
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -18,63 +19,76 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.automirrored.filled.MenuBook
+import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.cosmicoppai.lisa.data.remote.MangaKatanaScraper
 import com.cosmicoppai.lisa.data.repository.MediaRepository
 import com.cosmicoppai.lisa.model.DownloadFormat
+import com.cosmicoppai.lisa.model.MangaChapter
 import com.cosmicoppai.lisa.model.MangaDetailsResult
 import com.cosmicoppai.lisa.model.MangaSearchItem
 import com.cosmicoppai.lisa.ui.components.LisaErrorView
 import com.cosmicoppai.lisa.ui.components.LisaLoadingView
 import com.cosmicoppai.lisa.ui.components.LisaTopBackBar
 import com.cosmicoppai.lisa.ui.components.MangaPosterCard
+import com.cosmicoppai.lisa.ui.theme.LisaBorder
 import com.cosmicoppai.lisa.ui.theme.LisaPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaSurface
 import com.cosmicoppai.lisa.ui.theme.LisaTextPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaTextSecondary
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 data class MangaDetailsUiState(
     val manga: MangaSearchItem? = null,
     val detail: MangaDetailsResult? = null,
+    val ascendingChapters: Boolean = false,
     val isLoading: Boolean = true,
     val message: String? = null,
     val error: String? = null
@@ -87,21 +101,44 @@ class MangaDetailsViewModel @Inject constructor(
 
     private val _uiState = MutableStateFlow(MangaDetailsUiState())
     val uiState: StateFlow<MangaDetailsUiState> = _uiState.asStateFlow()
+    private var loadJob: Job? = null
 
     fun load(manga: MangaSearchItem) {
-        viewModelScope.launch {
-            _uiState.value = _uiState.value.copy(manga = manga, isLoading = true, error = null)
-            runCatching {
-                repository.getMangaDetails(manga.session)
-            }.onSuccess { result ->
-                _uiState.value = _uiState.value.copy(detail = result, isLoading = false)
-            }.onFailure { err ->
+        loadJob?.cancel()
+        val isDifferentManga = _uiState.value.manga?.session != manga.session
+        _uiState.value = _uiState.value.copy(
+            manga = manga,
+            detail = if (isDifferentManga) null else _uiState.value.detail,
+            isLoading = true,
+            error = null
+        )
+        loadJob = viewModelScope.launch {
+            try {
+                val result = repository.getMangaDetails(manga.session)
+                val resolvedPoster = manga.poster.ifBlank { result.description.poster }
+                val updatedManga = if (resolvedPoster != manga.poster) {
+                    manga.copy(poster = resolvedPoster)
+                } else {
+                    manga
+                }
+                _uiState.value = _uiState.value.copy(
+                    manga = updatedManga,
+                    detail = result,
+                    isLoading = false
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     error = err.message ?: "Failed to load manga details"
                 )
             }
         }
+    }
+
+    fun toggleChapterOrder() {
+        _uiState.value = _uiState.value.copy(ascendingChapters = !_uiState.value.ascendingChapters)
     }
 
     fun toggleReadlist() {
@@ -112,6 +149,17 @@ class MangaDetailsViewModel @Inject constructor(
             _uiState.value = _uiState.value.copy(
                 detail = detail.copy(inMyList = saved),
                 message = if (saved) "Added to Read List" else "Removed from Read List"
+            )
+        }
+    }
+
+    fun downloadChapter(chapter: MangaChapter) {
+        val manga = _uiState.value.manga ?: return
+        viewModelScope.launch {
+            val format = repository.settings.first().preferredMangaFormat
+            repository.downloadMangaChapter(manga.title, chapter, format, manga.poster)
+            _uiState.value = _uiState.value.copy(
+                message = "Scheduled ${chapter.chpName} (${format.name})"
             )
         }
     }
@@ -143,11 +191,12 @@ class MangaDetailsViewModel @Inject constructor(
 fun MangaDetailsScreen(
     manga: MangaSearchItem,
     onBack: () -> Unit,
-    onRead: (MangaSearchItem) -> Unit,
+    onRead: (MangaSearchItem, String?) -> Unit,
     onOpenRecommendation: (MangaSearchItem) -> Unit,
     viewModel: MangaDetailsViewModel = hiltViewModel()
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     var showFormatPicker by remember { mutableStateOf(false) }
 
     LaunchedEffect(manga.session) {
@@ -222,6 +271,24 @@ fun MangaDetailsScreen(
         }
 
         val detail = state.detail
+        val effectiveManga = state.manga?.takeIf { it.session == manga.session } ?: manga
+        val heroPoster = effectiveManga.poster.ifBlank { detail?.description?.poster.orEmpty() }
+        val displayedChapters = remember(detail?.chapters, state.ascendingChapters) {
+            val raw = detail?.chapters.orEmpty()
+            if (state.ascendingChapters) raw.reversed() else raw
+        }
+        val coverRequest = remember(heroPoster) {
+            if (heroPoster.isBlank()) {
+                null
+            } else {
+                ImageRequest.Builder(context)
+                    .data(heroPoster)
+                    .addHeader("Referer", "${MangaKatanaScraper.SITE_URL}/")
+                    .crossfade(true)
+                    .build()
+            }
+        }
+
         LazyColumn(
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -234,30 +301,49 @@ fun MangaDetailsScreen(
                         .clip(RoundedCornerShape(16.dp))
                         .background(LisaSurface)
                 ) {
-                    AsyncImage(
-                        model = manga.poster,
-                        contentDescription = null,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .matchParentSize()
-                            .blur(20.dp)
-                            .alpha(0.25f)
-                    )
+                    if (coverRequest != null) {
+                        AsyncImage(
+                            model = coverRequest,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .matchParentSize()
+                                .blur(20.dp)
+                                .alpha(0.25f)
+                        )
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(14.dp),
                         horizontalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
-                        AsyncImage(
-                            model = manga.poster,
-                            contentDescription = manga.title,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .width(120.dp)
-                                .aspectRatio(0.7f)
-                                .clip(RoundedCornerShape(12.dp))
-                        )
+                        if (coverRequest != null) {
+                            AsyncImage(
+                                model = coverRequest,
+                                contentDescription = effectiveManga.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .width(120.dp)
+                                    .aspectRatio(0.7f)
+                                    .clip(RoundedCornerShape(12.dp))
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .width(120.dp)
+                                    .aspectRatio(0.7f)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(LisaBorder),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.MenuBook,
+                                    contentDescription = null,
+                                    tint = LisaTextSecondary
+                                )
+                            }
+                        }
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = manga.title,
@@ -318,12 +404,12 @@ fun MangaDetailsScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Button(
-                            onClick = { onRead(manga) },
+                            onClick = { onRead(manga, null) },
                             modifier = Modifier.weight(1f)
                         ) {
                             Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
-                            Text("Read")
+                            Text("Read Ch. 1")
                         }
                         OutlinedButton(
                             onClick = { showFormatPicker = true },
@@ -345,11 +431,69 @@ fun MangaDetailsScreen(
                     )
                     Spacer(Modifier.height(10.dp))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        items(detail!!.recommendations, key = { it.session }) { rec ->
+                        itemsIndexed(
+                            items = detail!!.recommendations,
+                            key = { idx, rec -> "rec_${rec.session}_$idx" }
+                        ) { _, rec ->
                             Box(modifier = Modifier.width(150.dp)) {
                                 MangaPosterCard(
                                     item = rec,
                                     onClick = { onOpenRecommendation(rec) }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (displayedChapters.isNotEmpty()) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Chapters (${displayedChapters.size})",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        IconButton(onClick = viewModel::toggleChapterOrder) {
+                            Icon(Icons.Filled.SwapVert, contentDescription = "Sort Chapters")
+                        }
+                    }
+                }
+
+                itemsIndexed(
+                    items = displayedChapters,
+                    key = { idx, chapter -> "${chapter.chpSession}_$idx" }
+                ) { _, chapter ->
+                    Card(
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(containerColor = LisaSurface),
+                        border = BorderStroke(1.dp, LisaBorder),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onRead(manga, chapter.chpSession) }
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = chapter.chpName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = LisaTextPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            IconButton(onClick = { viewModel.downloadChapter(chapter) }) {
+                                Icon(
+                                    imageVector = Icons.Filled.Download,
+                                    contentDescription = "Download Chapter",
+                                    tint = LisaPrimary
                                 )
                             }
                         }

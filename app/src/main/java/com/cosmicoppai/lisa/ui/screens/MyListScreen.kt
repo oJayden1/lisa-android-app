@@ -78,24 +78,31 @@ class MyListViewModel @Inject constructor(
         if (isResolvingSession) return
         viewModelScope.launch {
             isResolvingSession = true
-            val resolvedSession = runCatching {
-                repository.resolveSessionById(entity.animeId)
-            }.getOrDefault(entity.session)
-            isResolvingSession = false
-            onOpenAnime(
-                AnimeSearchItem(
-                    title = entity.jpName,
-                    noOfEpisodes = entity.noOfEpisodes,
-                    type = entity.type,
-                    status = entity.status,
-                    season = entity.season,
-                    year = entity.year,
-                    score = entity.score,
-                    session = resolvedSession.ifBlank { entity.session },
-                    poster = entity.poster,
-                    animeId = entity.animeId
+            try {
+                val resolvedSession = try {
+                    repository.resolveSessionById(entity.animeId)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Throwable) {
+                    entity.session
+                }
+                onOpenAnime(
+                    AnimeSearchItem(
+                        title = entity.jpName,
+                        noOfEpisodes = entity.noOfEpisodes,
+                        type = entity.type,
+                        status = entity.status,
+                        season = entity.season,
+                        year = entity.year,
+                        score = entity.score,
+                        session = resolvedSession.ifBlank { entity.session },
+                        poster = entity.poster,
+                        animeId = entity.animeId
+                    )
                 )
-            )
+            } finally {
+                isResolvingSession = false
+            }
         }
     }
 

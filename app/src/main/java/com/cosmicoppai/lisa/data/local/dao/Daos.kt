@@ -78,6 +78,23 @@ interface DownloadDao {
         """
         UPDATE download_tasks
         SET status = :status,
+            sourceUrl = :sourceUrl,
+            manifestUrl = :manifestUrl,
+            errorMessage = NULL
+        WHERE id = :taskId
+        """
+    )
+    suspend fun rescheduleExisting(
+        taskId: Long,
+        sourceUrl: String,
+        manifestUrl: String,
+        status: DownloadStatus = DownloadStatus.SCHEDULED
+    )
+
+    @Query(
+        """
+        UPDATE download_tasks
+        SET status = :status,
             downloadedSegments = :downloadedSegments,
             totalSegments = :totalSegments,
             speedBytesPerSec = :speedBytesPerSec,

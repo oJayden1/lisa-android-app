@@ -6,6 +6,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -43,6 +45,7 @@ import androidx.lifecycle.viewModelScope
 import com.cosmicoppai.lisa.BuildConfig
 import com.cosmicoppai.lisa.R
 import com.cosmicoppai.lisa.data.local.LisaSettings
+import com.cosmicoppai.lisa.data.local.UserPreferences
 import com.cosmicoppai.lisa.data.repository.MediaRepository
 import com.cosmicoppai.lisa.model.DownloadFormat
 import com.cosmicoppai.lisa.ui.theme.LisaBorder
@@ -82,9 +85,25 @@ class SettingsViewModel @Inject constructor(
     }
 
     fun setBaseUrl(url: String) {
+        val normalized = UserPreferences.normalizeBaseUrl(url)
+        if (normalized == null) {
+            _statusMsg.value = "Invalid URL. Enter a valid domain (e.g. https://animepahe.pw)"
+            return
+        }
         viewModelScope.launch {
-            repository.setAnimepaheBaseUrl(url)
-            _statusMsg.value = "Updated AnimePahe base URL"
+            repository.setAnimepaheBaseUrl(normalized)
+            _statusMsg.value = "Updated AnimePahe base URL to $normalized"
+        }
+    }
+
+    fun verifyAccess() {
+        _statusMsg.value = "Opening AnimePahe verification..."
+        repository.requestAnimepaheVerification(settings.value.animepaheBaseUrl) { passed ->
+            _statusMsg.value = if (passed) {
+                "AnimePahe access verified and cookies saved"
+            } else {
+                "Verification cancelled"
+            }
         }
     }
 
@@ -109,6 +128,7 @@ class SettingsViewModel @Inject constructor(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     viewModel: SettingsViewModel = hiltViewModel()
@@ -227,15 +247,33 @@ fun SettingsScreen(
                         Text("Save URL")
                     }
                     OutlinedButton(onClick = {
-                        mirrorInput = "https://animepahe.ru"
-                        viewModel.setBaseUrl("https://animepahe.ru")
+                        mirrorInput = "https://animepahe.pw"
+                        viewModel.setBaseUrl("https://animepahe.pw")
                     }) {
-                        Text("Use .ru")
+                        Text(".pw")
+                    }
+                    OutlinedButton(onClick = {
+                        mirrorInput = "https://animepahe.org"
+                        viewModel.setBaseUrl("https://animepahe.org")
+                    }) {
+                        Text(".org")
+                    }
+                    OutlinedButton(onClick = {
+                        mirrorInput = "https://animepahe.com"
+                        viewModel.setBaseUrl("https://animepahe.com")
+                    }) {
+                        Text(".com")
                     }
                 }
                 Spacer(Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = viewModel::refreshCookies) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(onClick = viewModel::verifyAccess) {
+                        Text("Verify Access")
+                    }
+                    OutlinedButton(onClick = viewModel::refreshCookies) {
                         Text("Refresh Cookies")
                     }
                     OutlinedButton(onClick = viewModel::clearCookies) {

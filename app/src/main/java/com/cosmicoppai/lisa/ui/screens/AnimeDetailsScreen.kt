@@ -22,7 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
@@ -70,6 +70,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
+import com.cosmicoppai.lisa.data.remote.InteractiveCaptchaException
 import com.cosmicoppai.lisa.data.repository.MediaRepository
 import com.cosmicoppai.lisa.model.AnimeDescription
 import com.cosmicoppai.lisa.model.AnimeEpisode
@@ -88,6 +89,8 @@ import com.cosmicoppai.lisa.ui.theme.LisaSurfaceVariant
 import com.cosmicoppai.lisa.ui.theme.LisaTextPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaTextSecondary
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -109,7 +112,9 @@ data class AnimeDetailsUiState(
     val isBatchScheduling: Boolean = false,
     val singleDownloadOptions: Pair<AnimeEpisode, Map<String, List<StreamOption>>>? = null,
     val message: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val requiresVerification: Boolean = false,
+    val verificationSiteUrl: String = ""
 )
 
 @HiltViewModel
@@ -120,27 +125,32 @@ class AnimeDetailsViewModel @Inject constructor(
     private val _uiState = MutableStateFlow(AnimeDetailsUiState())
     val uiState: StateFlow<AnimeDetailsUiState> = _uiState.asStateFlow()
 
+    private var loadJob: Job? = null
+
     fun load(anime: AnimeSearchItem, page: Int = 1) {
-        viewModelScope.launch {
+        loadJob?.cancel()
+        loadJob = viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 anime = anime,
                 isLoading = true,
-                error = null
+                error = null,
+                requiresVerification = false,
+                verificationSiteUrl = ""
             )
-            runCatching {
+            try {
                 val pageData = repository.getAnimeDetails(anime.session, page)
-                val recs = if (page == 1 && _uiState.value.recommendations.isEmpty()) {
-                    runCatching { repository.getAnimeRecommendations(anime.session) }.getOrDefault(emptyList())
-                } else {
-                    _uiState.value.recommendations
+                val recs = when {
+                    pageData.includesRecommendations -> pageData.recommendations
+                    page == 1 && _uiState.value.recommendations.isEmpty() ->
+                        runCatching { repository.getAnimeRecommendations(anime.session) }.getOrDefault(emptyList())
+                    else -> _uiState.value.recommendations
                 }
-                pageData to recs
-            }.onSuccess { (pageData, recs) ->
                 val desc = pageData.description ?: _uiState.value.description
-                val saved = if (desc != null && desc.animeId > 0) {
-                    pageData.inMyList || _uiState.value.inMyList
-                } else {
-                    _uiState.value.inMyList
+                val effectiveAnimeId = desc?.animeId?.takeIf { it > 0 } ?: anime.animeId?.takeIf { it > 0 } ?: 0
+                val saved = when {
+                    (desc?.animeId ?: 0) > 0 && page == 1 -> pageData.inMyList
+                    effectiveAnimeId > 0 -> repository.observeIsAnimeSaved(effectiveAnimeId).first()
+                    else -> _uiState.value.inMyList
                 }
                 _uiState.value = _uiState.value.copy(
                     description = desc,
@@ -151,13 +161,35 @@ class AnimeDetailsViewModel @Inject constructor(
                     hasPrevPage = pageData.hasPrevPage,
                     inMyList = saved,
                     recommendations = recs,
-                    isLoading = false
+                    isLoading = false,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
                 )
-            }.onFailure { err ->
+            } catch (e: CancellationException) {
+                throw e
+            } catch (err: Throwable) {
+                val captcha = err as? InteractiveCaptchaException
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
-                    error = err.message ?: "Failed to load anime details"
+                    error = err.message ?: "Failed to load anime details",
+                    requiresVerification = captcha != null,
+                    verificationSiteUrl = captcha?.siteUrl.orEmpty()
                 )
+            }
+        }
+    }
+
+    fun verifyAndRetry(anime: AnimeSearchItem) {
+        val siteUrl = _uiState.value.verificationSiteUrl.takeIf { it.isNotBlank() }
+        val page = _uiState.value.currentPage
+        repository.requestAnimepaheVerification(siteUrl) { passed ->
+            if (passed) {
+                _uiState.value = _uiState.value.copy(
+                    error = null,
+                    requiresVerification = false,
+                    verificationSiteUrl = ""
+                )
+                load(anime, page)
             }
         }
     }
@@ -196,13 +228,14 @@ class AnimeDetailsViewModel @Inject constructor(
 
     fun startSingleEpisodeDownload(episode: AnimeEpisode, option: StreamOption) {
         val anime = _uiState.value.anime ?: return
+        val resolvedPoster = _uiState.value.description?.poster?.takeIf { it.isNotBlank() } ?: anime.poster
         dismissSingleDownloadPicker()
         viewModelScope.launch {
             repository.downloadAnimeEpisode(
                 seriesName = anime.title,
                 episodeName = "Episode ${episode.epNo} (${option.resolution}p ${option.audio.uppercase()})",
                 kwikUrl = option.kwikUrl,
-                posterUrl = anime.poster
+                posterUrl = resolvedPoster
             )
             _uiState.value = _uiState.value.copy(message = "Started download: Ep ${episode.epNo}")
         }
@@ -212,6 +245,7 @@ class AnimeDetailsViewModel @Inject constructor(
         val anime = _uiState.value.anime ?: return
         val eps = _uiState.value.episodes
         if (eps.isEmpty() || _uiState.value.isBatchScheduling) return
+        val resolvedPoster = _uiState.value.description?.poster?.takeIf { it.isNotBlank() } ?: anime.poster
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isBatchScheduling = true, message = "Scheduling ${eps.size} episodes...")
             val prefs = repository.settings.first()
@@ -222,7 +256,7 @@ class AnimeDetailsViewModel @Inject constructor(
                     episodes = eps,
                     preferredAudio = prefs.preferredAudio,
                     preferredQuality = prefs.preferredQuality,
-                    posterUrl = anime.poster
+                    posterUrl = resolvedPoster
                 )
             }.onSuccess {
                 _uiState.value = _uiState.value.copy(
@@ -298,7 +332,7 @@ fun AnimeDetailsScreen(
             actions = {
                 IconButton(
                     onClick = viewModel::toggleWatchlist,
-                    enabled = (state.description?.animeId ?: 0) > 0
+                    enabled = (state.description?.animeId ?: 0) > 0 || (anime.animeId ?: 0) > 0
                 ) {
                     Icon(
                         imageVector = if (state.inMyList) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
@@ -332,7 +366,12 @@ fun AnimeDetailsScreen(
             return@Column
         }
         if (state.error != null && state.episodes.isEmpty()) {
-            LisaErrorView(message = state.error!!, onRetry = { viewModel.load(anime, state.currentPage) })
+            LisaErrorView(
+                message = state.error!!,
+                onRetry = { viewModel.load(anime, state.currentPage) },
+                secondaryActionLabel = if (state.requiresVerification) "Verify & Retry" else null,
+                onSecondaryAction = if (state.requiresVerification) ({ viewModel.verifyAndRetry(anime) }) else null
+            )
             return@Column
         }
 
@@ -342,6 +381,7 @@ fun AnimeDetailsScreen(
             modifier = Modifier.fillMaxSize()
         ) {
             item {
+                val heroPoster = state.description?.poster?.takeIf { it.isNotBlank() } ?: anime.poster
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -349,7 +389,7 @@ fun AnimeDetailsScreen(
                         .background(LisaSurface)
                 ) {
                     AsyncImage(
-                        model = anime.poster,
+                        model = heroPoster,
                         contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
@@ -364,7 +404,7 @@ fun AnimeDetailsScreen(
                         horizontalArrangement = Arrangement.spacedBy(14.dp)
                     ) {
                         AsyncImage(
-                            model = anime.poster,
+                            model = heroPoster,
                             contentDescription = anime.title,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
@@ -419,7 +459,20 @@ fun AnimeDetailsScreen(
                                 }
                             }
                             Spacer(Modifier.height(8.dp))
-                            val epLabel = if (anime.noOfEpisodes == "?") "Ongoing" else "Episodes: ${anime.noOfEpisodes}"
+                            val epLabel = when {
+                                anime.noOfEpisodes == "?" -> "Ongoing"
+                                anime.noOfEpisodes.isNotBlank() && anime.noOfEpisodes != "0" ->
+                                    "Episodes: ${anime.noOfEpisodes}"
+                                state.episodes.isNotEmpty() -> {
+                                    val countText = if (state.totalPages > 1) {
+                                        "${state.episodes.size}+"
+                                    } else {
+                                        state.episodes.size.toString()
+                                    }
+                                    "Episodes: $countText"
+                                }
+                                else -> "Episodes: ${anime.noOfEpisodes}"
+                            }
                             Text(text = epLabel, style = MaterialTheme.typography.labelMedium)
                             state.description?.aired?.let {
                                 Text(text = it, style = MaterialTheme.typography.labelMedium)
@@ -490,7 +543,10 @@ fun AnimeDetailsScreen(
                 }
             }
 
-            items(state.episodes, key = { it.epSession }) { ep ->
+            itemsIndexed(
+                items = state.episodes,
+                key = { idx, ep -> "${state.currentPage}_${ep.epSession}_$idx" }
+            ) { _, ep ->
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -585,7 +641,10 @@ fun AnimeDetailsScreen(
                         Text("No recommendations available", style = MaterialTheme.typography.bodyMedium)
                     } else {
                         LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            items(state.recommendations, key = { it.session }) { rec ->
+                            itemsIndexed(
+                                items = state.recommendations,
+                                key = { idx, rec -> "rec_${rec.session}_$idx" }
+                            ) { _, rec ->
                                 Box(modifier = Modifier.width(150.dp)) {
                                     AnimePosterCard(item = rec, onClick = { onOpenRecommendation(rec) })
                                 }

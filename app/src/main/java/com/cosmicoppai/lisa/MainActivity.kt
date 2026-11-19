@@ -34,15 +34,19 @@ class MainActivity : ComponentActivity() {
             LisaTheme {
                 val mainViewModel: MainViewModel = hiltViewModel()
                 val activeDownloadsCount by mainViewModel.activeDownloadCount.collectAsStateWithLifecycle()
-                val challenge by mainViewModel.interactiveChallenge.collectAsStateWithLifecycle()
+                val interactiveChallenge by mainViewModel.interactiveChallenge.collectAsStateWithLifecycle()
 
                 LiSANavHost(activeDownloadsCount = activeDownloadsCount)
 
-                challenge?.let { req ->
+                interactiveChallenge?.let { challenge ->
                     WebViewChallengeDialog(
-                        challenge = req,
-                        onDone = { mainViewModel.completeInteractiveChallenge(req) },
-                        onDismiss = { mainViewModel.dismissInteractiveChallenge(req) }
+                        challenge = challenge,
+                        onDone = { finalUrl, userAgent ->
+                            mainViewModel.completeInteractiveChallenge(challenge, finalUrl, userAgent)
+                        },
+                        onDismiss = {
+                            mainViewModel.dismissInteractiveChallenge()
+                        }
                     )
                 }
             }

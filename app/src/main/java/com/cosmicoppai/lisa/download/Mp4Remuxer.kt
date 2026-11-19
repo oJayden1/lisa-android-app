@@ -51,6 +51,7 @@ object Mp4Remuxer {
 
         val extractor = MediaExtractor()
         var muxer: MediaMuxer? = null
+        var muxerStarted = false
         try {
             extractor.setDataSource(tempCombinedFile.absolutePath)
             val trackCount = extractor.trackCount
@@ -76,9 +77,11 @@ object Mp4Remuxer {
             }
 
             muxer.start()
+            muxerStarted = true
             val bufferSize = 2 * 1024 * 1024
             val dstBuf = ByteBuffer.allocateDirect(bufferSize)
             val bufferInfo = MediaCodec.BufferInfo()
+            val lastPtsByTrack = mutableMapOf<Int, Long>()
 
             while (true) {
                 dstBuf.clear()
@@ -90,7 +93,11 @@ object Mp4Remuxer {
                 if (muxerTrack != null) {
                     bufferInfo.offset = 0
                     bufferInfo.size = sampleSize
-                    bufferInfo.presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
+                    val rawPts = extractor.sampleTime.coerceAtLeast(0L)
+                    val prevPts = lastPtsByTrack[muxerTrack]
+                    val safePts = if (prevPts != null && rawPts <= prevPts) prevPts + 1L else rawPts
+                    lastPtsByTrack[muxerTrack] = safePts
+                    bufferInfo.presentationTimeUs = safePts
                     val sampleFlags = extractor.sampleFlags
                     var codecFlags = 0
                     if ((sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
@@ -104,8 +111,13 @@ object Mp4Remuxer {
                 }
                 extractor.advance()
             }
+        } catch (t: Throwable) {
+            runCatching { if (outputMp4File.exists()) outputMp4File.delete() }
+            throw t
         } finally {
-            runCatching { muxer?.stop() }
+            if (muxerStarted) {
+                runCatching { muxer?.stop() }
+            }
             runCatching { muxer?.release() }
             runCatching { extractor.release() }
         }

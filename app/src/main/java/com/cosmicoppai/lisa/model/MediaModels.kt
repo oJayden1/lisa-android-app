@@ -64,7 +64,8 @@ data class AnimeDescription(
     val season: String = "",
     val year: String = "",
     val duration: String = "",
-    val themes: List<String> = emptyList()
+    val themes: List<String> = emptyList(),
+    val poster: String? = null
 )
 
 data class AnimeDetailsPage(
@@ -74,7 +75,9 @@ data class AnimeDetailsPage(
     val hasNextPage: Boolean,
     val hasPrevPage: Boolean,
     val description: AnimeDescription? = null,
-    val inMyList: Boolean = false
+    val inMyList: Boolean = false,
+    val recommendations: List<AnimeSearchItem> = emptyList(),
+    val includesRecommendations: Boolean = false
 )
 
 @Serializable
@@ -111,7 +114,8 @@ data class MangaChapter(
 data class MangaDescription(
     val altName: String? = null,
     val author: String? = null,
-    val summary: String = ""
+    val summary: String = "",
+    val poster: String = ""
 )
 
 data class MangaDetailsResult(

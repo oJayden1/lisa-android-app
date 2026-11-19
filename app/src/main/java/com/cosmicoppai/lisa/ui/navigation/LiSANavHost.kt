@@ -1,6 +1,5 @@
 package com.cosmicoppai.lisa.ui.navigation
 
-import android.net.Uri
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -22,6 +21,7 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -54,6 +54,7 @@ import com.cosmicoppai.lisa.ui.theme.LisaSurface
 import com.cosmicoppai.lisa.ui.theme.LisaTextSecondary
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.util.Base64
 
 sealed class TopTab(val route: String, val label: String, val icon: ImageVector) {
     data object Search : TopTab("search", "Search", Icons.Filled.Search)
@@ -71,7 +72,28 @@ private val topTabs = listOf(
     TopTab.Settings
 )
 
-private val navJson = Json { ignoreUnknownKeys = true; isLenient = true }
+internal val navJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+internal fun encodeNavArg(raw: String): String {
+    if (raw.isEmpty()) return ""
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(raw.toByteArray(Charsets.UTF_8))
+}
+
+internal fun decodeNavArg(encoded: String): String? {
+    if (encoded.isBlank()) return ""
+    return runCatching {
+        String(Base64.getUrlDecoder().decode(encoded), Charsets.UTF_8)
+    }.getOrNull()
+}
+
+internal inline fun <reified T> encodeNavJson(value: T): String {
+    return encodeNavArg(navJson.encodeToString(value))
+}
+
+internal inline fun <reified T> decodeNavJson(encoded: String): T? {
+    val decoded = decodeNavArg(encoded)?.takeIf { it.isNotBlank() } ?: return null
+    return runCatching { navJson.decodeFromString<T>(decoded) }.getOrNull()
+}
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -83,24 +105,25 @@ fun LiSANavHost(activeDownloadsCount: Int) {
     val useRail = LocalConfiguration.current.screenWidthDp >= 600
 
     fun navigateAnimeDetails(item: AnimeSearchItem) {
-        val encoded = Uri.encode(navJson.encodeToString(item))
+        val encoded = encodeNavJson(item)
         navController.navigate("anime_details?item=$encoded")
     }
 
     fun navigateMangaDetails(item: MangaSearchItem) {
-        val encoded = Uri.encode(navJson.encodeToString(item))
+        val encoded = encodeNavJson(item)
         navController.navigate("manga_details?item=$encoded")
     }
 
     fun navigateAnimePlayer(item: AnimeSearchItem, ep: AnimeEpisode, page: Int) {
-        val a = Uri.encode(navJson.encodeToString(item))
-        val e = Uri.encode(navJson.encodeToString(ep))
+        val a = encodeNavJson(item)
+        val e = encodeNavJson(ep)
         navController.navigate("anime_player?anime=$a&ep=$e&page=$page")
     }
 
-    fun navigateMangaReader(item: MangaSearchItem) {
-        val encoded = Uri.encode(navJson.encodeToString(item))
-        navController.navigate("manga_reader?item=$encoded")
+    fun navigateMangaReader(item: MangaSearchItem, chapterSession: String? = null) {
+        val encoded = encodeNavJson(item)
+        val encodedChp = encodeNavArg(chapterSession.orEmpty())
+        navController.navigate("manga_reader?item=$encoded&chapter=$encodedChp")
     }
 
     val navContent: @Composable (Modifier) -> Unit = { mod ->
@@ -141,26 +164,34 @@ fun LiSANavHost(activeDownloadsCount: Int) {
                 arguments = listOf(navArgument("item") { type = NavType.StringType })
             ) { entry ->
                 val raw = entry.arguments?.getString("item").orEmpty()
-                val anime = navJson.decodeFromString<AnimeSearchItem>(Uri.decode(raw))
-                AnimeDetailsScreen(
-                    anime = anime,
-                    onBack = { navController.popBackStack() },
-                    onPlayEpisode = ::navigateAnimePlayer,
-                    onOpenRecommendation = ::navigateAnimeDetails
-                )
+                val anime = decodeNavJson<AnimeSearchItem>(raw)
+                if (anime == null) {
+                    LaunchedEffect(raw) { navController.popBackStack() }
+                } else {
+                    AnimeDetailsScreen(
+                        anime = anime,
+                        onBack = { navController.popBackStack() },
+                        onPlayEpisode = ::navigateAnimePlayer,
+                        onOpenRecommendation = ::navigateAnimeDetails
+                    )
+                }
             }
             composable(
                 route = "manga_details?item={item}",
                 arguments = listOf(navArgument("item") { type = NavType.StringType })
             ) { entry ->
                 val raw = entry.arguments?.getString("item").orEmpty()
-                val manga = navJson.decodeFromString<MangaSearchItem>(Uri.decode(raw))
-                MangaDetailsScreen(
-                    manga = manga,
-                    onBack = { navController.popBackStack() },
-                    onRead = ::navigateMangaReader,
-                    onOpenRecommendation = ::navigateMangaDetails
-                )
+                val manga = decodeNavJson<MangaSearchItem>(raw)
+                if (manga == null) {
+                    LaunchedEffect(raw) { navController.popBackStack() }
+                } else {
+                    MangaDetailsScreen(
+                        manga = manga,
+                        onBack = { navController.popBackStack() },
+                        onRead = ::navigateMangaReader,
+                        onOpenRecommendation = ::navigateMangaDetails
+                    )
+                }
             }
             composable(
                 route = "anime_player?anime={anime}&ep={ep}&page={page}",
@@ -173,25 +204,38 @@ fun LiSANavHost(activeDownloadsCount: Int) {
                 val animeRaw = entry.arguments?.getString("anime").orEmpty()
                 val epRaw = entry.arguments?.getString("ep").orEmpty()
                 val page = entry.arguments?.getInt("page") ?: 1
-                val anime = navJson.decodeFromString<AnimeSearchItem>(Uri.decode(animeRaw))
-                val ep = navJson.decodeFromString<AnimeEpisode>(Uri.decode(epRaw))
-                AnimePlayerScreen(
-                    anime = anime,
-                    initialEpisode = ep,
-                    initialPage = page,
-                    onBack = { navController.popBackStack() }
-                )
+                val anime = decodeNavJson<AnimeSearchItem>(animeRaw)
+                val ep = decodeNavJson<AnimeEpisode>(epRaw)
+                if (anime == null || ep == null) {
+                    LaunchedEffect(animeRaw, epRaw) { navController.popBackStack() }
+                } else {
+                    AnimePlayerScreen(
+                        anime = anime,
+                        initialEpisode = ep,
+                        initialPage = page,
+                        onBack = { navController.popBackStack() }
+                    )
+                }
             }
             composable(
-                route = "manga_reader?item={item}",
-                arguments = listOf(navArgument("item") { type = NavType.StringType })
+                route = "manga_reader?item={item}&chapter={chapter}",
+                arguments = listOf(
+                    navArgument("item") { type = NavType.StringType },
+                    navArgument("chapter") { type = NavType.StringType; defaultValue = "" }
+                )
             ) { entry ->
                 val raw = entry.arguments?.getString("item").orEmpty()
-                val manga = navJson.decodeFromString<MangaSearchItem>(Uri.decode(raw))
-                MangaReaderScreen(
-                    manga = manga,
-                    onBack = { navController.popBackStack() }
-                )
+                val chp = decodeNavArg(entry.arguments?.getString("chapter").orEmpty())?.takeIf { it.isNotBlank() }
+                val manga = decodeNavJson<MangaSearchItem>(raw)
+                if (manga == null) {
+                    LaunchedEffect(raw) { navController.popBackStack() }
+                } else {
+                    MangaReaderScreen(
+                        manga = manga,
+                        initialChapterSession = chp,
+                        onBack = { navController.popBackStack() }
+                    )
+                }
             }
             composable(
                 route = "local_player/{taskId}",

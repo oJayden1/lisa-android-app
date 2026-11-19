@@ -65,8 +65,27 @@ class MediaRepository @Inject constructor(
         cookieResolver.ensureSession(CloudflareCookieResolver.ANIMEPAHE_SITE, baseUrl, forceRefresh = true)
     }
 
-    suspend fun persistInteractiveChallenge(siteName: String, siteUrl: String) {
-        cookieResolver.persistInteractiveResult(siteName, siteUrl)
+    fun requestAnimepaheVerification(
+        siteUrl: String? = null,
+        onCompleted: (Boolean) -> Unit
+    ) {
+        cookieResolver.requestInteractiveVerification(
+            siteName = CloudflareCookieResolver.ANIMEPAHE_SITE,
+            siteUrl = siteUrl.orEmpty(),
+            onCompleted = onCompleted
+        )
+    }
+
+    fun dismissInteractiveChallenge() {
+        cookieResolver.dismissInteractiveChallenge()
+    }
+
+    suspend fun persistInteractiveChallenge(
+        siteName: String,
+        siteUrl: String,
+        userAgentOverride: String? = null
+    ) {
+        cookieResolver.persistInteractiveResult(siteName, siteUrl, userAgentOverride)
     }
 
     suspend fun clearCookies() = cookieResolver.clearCookies()
@@ -125,8 +144,7 @@ class MediaRepository @Inject constructor(
     fun observeIsMangaSaved(mangaId: String): Flow<Boolean> = readlistDao.observeIsSaved(mangaId)
 
     suspend fun toggleWatchlist(item: AnimeSearchItem, description: AnimeDescription?): Boolean {
-        val animeId = description?.animeId ?: item.animeId ?: return false
-        if (animeId <= 0) return false
+        val animeId = description?.animeId?.takeIf { it > 0 } ?: item.animeId?.takeIf { it > 0 } ?: return false
         val currentlySaved = watchlistDao.isSaved(animeId)
         if (currentlySaved) {
             watchlistDao.delete(animeId)
@@ -142,7 +160,7 @@ class MediaRepository @Inject constructor(
                 season = description?.season ?: item.season,
                 year = description?.year ?: item.year,
                 score = item.score,
-                poster = item.poster,
+                poster = item.poster.ifBlank { description?.poster.orEmpty() },
                 session = item.session
             )
         )

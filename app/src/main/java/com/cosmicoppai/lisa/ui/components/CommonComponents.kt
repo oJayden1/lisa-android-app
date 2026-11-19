@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.BorderStroke
@@ -26,6 +28,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.BrokenImage
 import androidx.compose.material3.Button
@@ -35,6 +38,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
@@ -42,12 +46,18 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -57,7 +67,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 import com.cosmicoppai.lisa.R
+import com.cosmicoppai.lisa.data.remote.CloudflareCookieResolver
 import com.cosmicoppai.lisa.data.remote.CookieChallengeRequest
 import com.cosmicoppai.lisa.model.AnimeSearchItem
 import com.cosmicoppai.lisa.model.AppMode
@@ -69,7 +81,9 @@ import com.cosmicoppai.lisa.ui.theme.LisaSurface
 import com.cosmicoppai.lisa.ui.theme.LisaSurfaceVariant
 import com.cosmicoppai.lisa.ui.theme.LisaTextPrimary
 import com.cosmicoppai.lisa.ui.theme.LisaTextSecondary
+import org.json.JSONTokener
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
 fun AppModeSwitchBar(
@@ -223,12 +237,33 @@ fun MangaPosterCard(
                     .aspectRatio(0.72f)
                     .background(LisaSurfaceVariant)
             ) {
-                AsyncImage(
-                    model = item.poster,
-                    contentDescription = item.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
+                val context = LocalContext.current
+                var loadFailed by remember(item.poster) { mutableStateOf(false) }
+                if (item.poster.isNotBlank() && !loadFailed) {
+                    val posterRequest = remember(item.poster) {
+                        ImageRequest.Builder(context)
+                            .data(item.poster)
+                            .addHeader("Referer", "https://mangakatana.com/")
+                            .crossfade(true)
+                            .build()
+                    }
+                    AsyncImage(
+                        model = posterRequest,
+                        contentDescription = item.title,
+                        contentScale = ContentScale.Crop,
+                        onError = { loadFailed = true },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.MenuBook,
+                        contentDescription = null,
+                        tint = LisaTextSecondary.copy(alpha = 0.55f),
+                        modifier = Modifier
+                            .size(36.dp)
+                            .align(Alignment.Center)
+                    )
+                }
                 if (item.status.isNotBlank()) {
                     Surface(
                         color = LisaSurface.copy(alpha = 0.88f),
@@ -364,7 +399,9 @@ fun LisaNotFoundView(
 fun LisaErrorView(
     message: String,
     onRetry: (() -> Unit)? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    secondaryActionLabel: String? = null,
+    onSecondaryAction: (() -> Unit)? = null
 ) {
     Column(
         modifier = modifier
@@ -384,10 +421,33 @@ fun LisaErrorView(
             style = MaterialTheme.typography.bodyMedium,
             textAlign = TextAlign.Center
         )
-        if (onRetry != null) {
+        val hasSecondary = onSecondaryAction != null && !secondaryActionLabel.isNullOrBlank()
+        if (hasSecondary || onRetry != null) {
             Spacer(Modifier.height(14.dp))
-            Button(onClick = onRetry, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)) {
-                Text("Retry")
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (hasSecondary) {
+                    Button(
+                        onClick = onSecondaryAction!!,
+                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                    ) {
+                        Text(secondaryActionLabel!!)
+                    }
+                    if (onRetry != null) {
+                        OutlinedButton(
+                            onClick = onRetry,
+                            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 10.dp)
+                        ) {
+                            Text("Retry")
+                        }
+                    }
+                } else if (onRetry != null) {
+                    Button(
+                        onClick = onRetry,
+                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                    ) {
+                        Text("Retry")
+                    }
+                }
             }
         }
     }
@@ -397,9 +457,31 @@ fun LisaErrorView(
 @Composable
 fun WebViewChallengeDialog(
     challenge: CookieChallengeRequest,
-    onDone: () -> Unit,
+    onDone: (finalUrl: String, userAgent: String) -> Unit,
     onDismiss: () -> Unit
 ) {
+    var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var latestUrl by remember(challenge) { mutableStateOf(challenge.siteUrl) }
+    var activeUserAgent by remember(challenge) { mutableStateOf(CloudflareCookieResolver.DEFAULT_USER_AGENT) }
+    val completedOnce = remember(challenge) { AtomicBoolean(false) }
+
+    fun finishOnce(url: String, ua: String) {
+        if (completedOnce.compareAndSet(false, true)) {
+            runCatching { CookieManager.getInstance().flush() }
+            onDone(url.ifBlank { challenge.siteUrl }, ua)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            runCatching {
+                webViewRef?.stopLoading()
+                webViewRef?.destroy()
+            }
+            webViewRef = null
+        }
+    }
+
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -419,13 +501,27 @@ fun WebViewChallengeDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Verify ${challenge.siteName} access",
-                        style = MaterialTheme.typography.titleMedium
-                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Verify ${challenge.siteName} access",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = "Closes automatically once verification passes",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = LisaTextSecondary
+                        )
+                    }
                     Row {
                         TextButton(onClick = onDismiss) { Text("Cancel") }
-                        Button(onClick = onDone) { Text("Continue") }
+                        Button(
+                            onClick = {
+                                finishOnce(
+                                    webViewRef?.url.orEmpty().ifBlank { latestUrl },
+                                    activeUserAgent
+                                )
+                            }
+                        ) { Text("Done") }
                     }
                 }
                 AndroidView(
@@ -438,12 +534,52 @@ fun WebViewChallengeDialog(
                                 ViewGroup.LayoutParams.MATCH_PARENT,
                                 ViewGroup.LayoutParams.MATCH_PARENT
                             )
-                            CookieManager.getInstance().setAcceptCookie(true)
-                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            val cm = CookieManager.getInstance()
+                            cm.setAcceptCookie(true)
+                            cm.setAcceptThirdPartyCookies(this, true)
+                            val defaultUa = WebSettings.getDefaultUserAgent(ctx)
                             settings.javaScriptEnabled = true
                             settings.domStorageEnabled = true
-                            webViewClient = WebViewClient()
+                            settings.userAgentString = defaultUa
+                            activeUserAgent = settings.userAgentString ?: defaultUa
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldOverrideUrlLoading(
+                                    view: WebView?,
+                                    request: WebResourceRequest?
+                                ): Boolean {
+                                    return false
+                                }
+
+                                override fun onPageFinished(view: WebView?, url: String?) {
+                                    if (!url.isNullOrBlank()) {
+                                        latestUrl = url
+                                    }
+                                    if (completedOnce.get() || view == null || url.isNullOrBlank()) return
+                                    if (url == "about:blank") return
+                                    view.evaluateJavascript(
+                                        "document.documentElement ? document.documentElement.outerHTML : ''"
+                                    ) { raw ->
+                                        if (completedOnce.get()) return@evaluateJavascript
+                                        val html = if (raw != null && raw != "null") {
+                                            runCatching {
+                                                JSONTokener(raw).nextValue()?.toString().orEmpty()
+                                            }.getOrDefault("")
+                                        } else {
+                                            ""
+                                        }
+                                        val cookies = runCatching { cm.getCookie(url).orEmpty() }.getOrDefault("")
+                                        val passed = html.length > 200 &&
+                                            cookies.isNotBlank() &&
+                                            !CloudflareCookieResolver.isChallengeInterstitial(html) &&
+                                            !CloudflareCookieResolver.hasInteractiveCaptchaMarker(html)
+                                        if (passed) {
+                                            finishOnce(url, activeUserAgent)
+                                        }
+                                    }
+                                }
+                            }
                             webChromeClient = WebChromeClient()
+                            webViewRef = this
                             loadUrl(challenge.siteUrl)
                         }
                     }
